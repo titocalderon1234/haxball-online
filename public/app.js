@@ -21,6 +21,7 @@ let contextPlayerId=null;
 let accumulator=0,lastFrame=performance.now(),lastRender=0,audioCtx=null,chatDrag=null;
 let prevPhysicsSnapshot=null,currPhysicsSnapshot=null,lastNetPacket=null,lastNetSnapshotAt=0,inputSeq=0,lastSentInput='',myPing=0;
 let peerLinks=new Map(),hostLink=null,peerInputs=new Map(),hostSnapshotDivider=0,hostMetaDivider=0,hostPendingWinner=0,hostFinishing=false;
+let connectionInterruptedHandled=false,hostInterruptTimer=null;
 const RTC_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}],iceCandidatePoolSize:2};
 let pendingRoomFromUrl=new URLSearchParams(location.search).get('room')||null,lastJoinPassword='';
 
@@ -75,8 +76,23 @@ function show(view){for(const id of ['nickView','roomsView','createView','gameVi
 function isHost(){return !!room.id&&!!room.hostPeerId&&socket.id===room.hostPeerId;}
 function dcOpen(dc){return !!dc&&dc.readyState==='open';}
 function safeDcSend(dc,obj){if(!dcOpen(dc))return false;try{dc.send(JSON.stringify(obj));return true;}catch{return false;}}
+function clearHostInterruptTimer(){if(hostInterruptTimer){clearTimeout(hostInterruptTimer);hostInterruptTimer=null;}}
+function interruptConnection(message='La conexión se interrumpió.'){
+  if(connectionInterruptedHandled||!room.id)return;
+  connectionInterruptedHandled=true;clearHostInterruptTimer();keys.clear();
+  try{if(socket.connected)socket.emit('room:leave');}catch{}
+  resetToLobby();setTimeout(()=>alert(message),0);
+}
+function scheduleHostInterrupt(link,delay=2400){
+  if(!room.id||isHost()||!link||link.peerId!==room.hostPeerId)return;
+  clearHostInterruptTimer();
+  hostInterruptTimer=setTimeout(()=>{
+    hostInterruptTimer=null;
+    if(room.id&&!isHost()&&room.hostPeerId===link.peerId&&!dcOpen(hostLink?.dc))interruptConnection();
+  },delay);
+}
 function closeLink(link){if(!link)return;try{link.dc&&link.dc.close();}catch{}try{link.pc&&link.pc.close();}catch{}}
-function closeAllRtc(){for(const l of peerLinks.values())closeLink(l);peerLinks.clear();closeLink(hostLink);hostLink=null;peerInputs.clear();myPing=isHost()?0:999;}
+function closeAllRtc(){clearHostInterruptTimer();for(const l of peerLinks.values())closeLink(l);peerLinks.clear();closeLink(hostLink);hostLink=null;peerInputs.clear();myPing=isHost()?0:999;}
 function queueOrAddIce(link,candidate){if(!link||!candidate)return;if(link.pc.remoteDescription){link.pc.addIceCandidate(candidate).catch(()=>{});}else link.pendingIce.push(candidate);}
 async function flushIce(link){if(!link?.pc?.remoteDescription)return;const q=link.pendingIce.splice(0);for(const c of q)try{await link.pc.addIceCandidate(c);}catch{}}
 function makePc(peerId){
@@ -86,10 +102,10 @@ function makePc(peerId){
 }
 function bindGameChannel(link,dc,asHost){
   link.dc=dc;dc.binaryType='arraybuffer';
-  dc.onopen=()=>{if(asHost){sendHostSnapshot(true,link);safeDcSend(dc,{t:'hello',host:true});}else{safeDcSend(dc,{t:'hello',host:false});startDirectPing();}};
+  dc.onopen=()=>{if(asHost){sendHostSnapshot(true,link);safeDcSend(dc,{t:'hello',host:true});}else{clearHostInterruptTimer();safeDcSend(dc,{t:'hello',host:false});startDirectPing();}};
   dc.onmessage=e=>{let m;try{m=JSON.parse(e.data);}catch{return;}if(asHost)handleGuestData(link,m);else handleHostData(link,m);};
-  dc.onclose=()=>{if(!room.id)return;if(asHost){peerInputs.delete(link.playerId);setTimeout(syncPeerTopology,700);}else{myPing=999;$('#pingHud').textContent='Ping: —';setTimeout(syncPeerTopology,700);}};
-  dc.onerror=()=>{};
+  dc.onclose=()=>{if(!room.id)return;if(asHost){peerInputs.delete(link.playerId);setTimeout(syncPeerTopology,700);}else{myPing=999;$('#pingHud').textContent='Ping: —';if(link.peerId===room.hostPeerId)scheduleHostInterrupt(link);setTimeout(syncPeerTopology,700);}};
+  dc.onerror=()=>{if(!asHost&&link.peerId===room.hostPeerId)scheduleHostInterrupt(link);};
 }
 async function createHostPeer(p){
   if(!isHost()||!p?.peerId||p.bot||p.id===myPlayerId||peerLinks.has(p.peerId))return;
@@ -102,7 +118,12 @@ async function acceptHostOffer(from,sdp){
   if(!room.id||isHost()||from!==room.hostPeerId)return;
   closeLink(hostLink);hostLink=makePc(from);
   hostLink.pc.ondatachannel=e=>bindGameChannel(hostLink,e.channel,false);
-  hostLink.pc.onconnectionstatechange=()=>{if(['failed','closed'].includes(hostLink?.pc?.connectionState)){closeLink(hostLink);hostLink=null;myPing=999;setTimeout(syncPeerTopology,900);}};
+  hostLink.pc.onconnectionstatechange=()=>{
+    const link=hostLink,state=link?.pc?.connectionState;if(!link)return;
+    if(state==='connected'){clearHostInterruptTimer();return;}
+    if(state==='disconnected'){scheduleHostInterrupt(link,2600);return;}
+    if(['failed','closed'].includes(state)){if(link.peerId===room.hostPeerId)scheduleHostInterrupt(link,900);closeLink(link);if(hostLink===link)hostLink=null;myPing=999;setTimeout(syncPeerTopology,900);}
+  };
   try{await hostLink.pc.setRemoteDescription(sdp);await flushIce(hostLink);const ans=await hostLink.pc.createAnswer();await hostLink.pc.setLocalDescription(ans);socket.emit('rtc:answer',{target:from,sdp:hostLink.pc.localDescription});}catch{closeLink(hostLink);hostLink=null;}
 }
 async function acceptGuestAnswer(from,sdp){const link=peerLinks.get(from);if(!link||!isHost())return;try{await link.pc.setRemoteDescription(sdp);await flushIce(link);}catch{}}
@@ -206,11 +227,11 @@ $('#optionsFromLobby').onclick=openSettings;
 $('#logoutBtn').onclick=()=>{show('nickView');setTimeout(()=>$('#nickInput').focus(),0);};
 $('#replaysBtn').onclick=()=>alert('Las repeticiones se graban desde una sala con el botón Grabar.');
 
-socket.on('connect',()=>{socket.emit('rooms:get');});
+socket.on('connect',()=>{if(!room.id)connectionInterruptedHandled=false;socket.emit('rooms:get');});
 socket.on('rooms:list',list=>{onlineRooms=Array.isArray(list)?list:[];if(!selectedRoomId)selectedRoomId=onlineRooms[0]?.id||null;renderRoomList();
   if(pendingRoomFromUrl&&$('#roomsView')&&!$('#roomsView').classList.contains('hidden')){const r=onlineRooms.find(x=>x.id===pendingRoomFromUrl);if(r){selectedRoomId=r.id;pendingRoomFromUrl=null;setTimeout(joinSelectedRoom,30);}}
 });
-socket.on('disconnect',()=>{if(room.id)addSystem('Conexión perdida. Intentando reconectar…');});
+socket.on('disconnect',()=>{if(room.id)interruptConnection();});
 socket.on('room:closed',data=>{alert(data?.message||'La sala se cerró.');resetToLobby();});
 socket.on('room:kicked',data=>{alert(data?.ban?'Fuiste baneado de la sala.':'Fuiste expulsado de la sala.');resetToLobby();});
 socket.on('chat:message',m=>{if(!m)return;addChat(m.text||'',m.type||'system',m.name||'');});
@@ -219,7 +240,8 @@ socket.on('chat:message',m=>{if(!m)return;addChat(m.text||'',m.type||'system',m.
 function currentActiveSignature(){return players.filter(p=>p.team===1||p.team===2).map(p=>p.id).join(',');}
 function worldActiveSignature(){return world?.players?.map(p=>p.id).join(',')||'';}
 function ensureGameWorld(force=false,oldWorld=null){
-  if(!(gameRunning||endingGame)){world=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;lastNetPacket=null;return;}
+  if(force)resetVisualLocalPlayer();
+  if(!(gameRunning||endingGame)){world=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;lastNetPacket=null;resetVisualLocalPlayer();return;}
   if(!force&&world&&worldActiveSignature()===currentActiveSignature())return;
   if(isHost()){
     world=oldWorld?rebuildHostWorld(oldWorld):new E.World(selectedStadium,players);
@@ -251,13 +273,14 @@ function applyRoomState(st){
   if(isHost()&&world&&(started||mustRebuild||wasPaused!==paused))setTimeout(()=>sendHostSnapshot(true),0);
 }
 function enterRoomState(st){
+  connectionInterruptedHandled=false;clearHostInterruptTimer();resetVisualLocalPlayer();
   room={id:st.id,name:st.name,maxPlayers:st.maxPlayers,password:'',unlisted:st.unlisted,owned:myPlayerId===st.ownerPlayerId,hostPeerId:st.hostPeerId||null,timeLimit:st.timeLimit,scoreLimit:st.scoreLimit};
   closeAllRtc();players=[];world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;overtime=false;elapsedTicks=0;endingGame=false;finalWinner=0;goalScoringTeam=0;menuOpen=true;keys.clear();resetVisualCamera();
   clearChat();applyRoomState(st);if(settings.extrapolationTouched)addSystem(`Extrapolation: ${settings.extrapolation} ms.`);applySettingsToUI();resizeCanvas();show('gameView');setRoomMenu(!(gameRunning||endingGame));render();
   setTimeout(reportPageVisibility,0);
 }
 function resetToLobby(){
-  closeAllRtc();room={id:null,name:'',maxPlayers:8,password:'',unlisted:false,owned:false,hostPeerId:null};players=[];myPlayerId=null;world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;endingGame=false;keys.clear();hidePlayerContext();show('roomsView');socket.emit('rooms:get');
+  resetVisualLocalPlayer();closeAllRtc();room={id:null,name:'',maxPlayers:8,password:'',unlisted:false,owned:false,hostPeerId:null};players=[];myPlayerId=null;world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;endingGame=false;keys.clear();hidePlayerContext();show('roomsView');socket.emit('rooms:get');
 }
 function leaveRoom(){socket.emit('room:leave',{},()=>resetToLobby());}
 $('#leaveRoomBtn').onclick=leaveRoom;
@@ -424,11 +447,32 @@ function blendSnapshots(a,b,t){
   }
   return out;
 }
+const visualLocalPlayer={x:0,y:0,vx:0,vy:0,ready:false,lastTime:0,key:''};
+function resetVisualLocalPlayer(){visualLocalPlayer.ready=false;visualLocalPlayer.lastTime=0;visualLocalPlayer.key='';}
+function smoothLocalPlayerSnapshot(snap){
+  // Solo suaviza la presentación del jugador local. La física y el valor de
+  // Extrapolation siguen siendo exactamente los mismos.
+  const extra=Number(settings.extrapolation)||0,w=Number(selectedStadium?.width)||0,h=Number(selectedStadium?.height)||0;
+  if(isHost()||!world||!gameRunning||paused||endingGame||extra<=0||(w<700&&h<320)){resetVisualLocalPlayer();return snap;}
+  const me=human(),idx=me&&world.playerIndexById.get(me.id),target=(idx!=null?snap?.[idx]:null);if(!target){resetVisualLocalPlayer();return snap;}
+  const now=performance.now(),key=`${room.id||''}|${selectedStadiumKey}|${me.id}`;
+  if(!visualLocalPlayer.ready||visualLocalPlayer.key!==key){visualLocalPlayer.x=target.x;visualLocalPlayer.y=target.y;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;visualLocalPlayer.ready=true;visualLocalPlayer.key=key;visualLocalPlayer.lastTime=now;return snap;}
+  const dt=Math.min(.04,Math.max(0,(now-visualLocalPlayer.lastTime)/1000));visualLocalPlayer.lastTime=now;
+  const dx=target.x-visualLocalPlayer.x,dy=target.y-visualLocalPlayer.y,dist2=dx*dx+dy*dy;
+  if(dist2>3600){visualLocalPlayer.x=target.x;visualLocalPlayer.y=target.y;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;}
+  else{
+    visualLocalPlayer.x+=target.vx*dt*60;visualLocalPlayer.y+=target.vy*dt*60;
+    const ex=target.x-visualLocalPlayer.x,ey=target.y-visualLocalPlayer.y,k=1-Math.exp(-dt*28);
+    visualLocalPlayer.x+=ex*k;visualLocalPlayer.y+=ey*k;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;
+  }
+  const out=snap.slice();out[idx]=Object.assign({},target,{x:visualLocalPlayer.x,y:visualLocalPlayer.y});return out;
+}
 function currentSnapshot(){
   if(!world)return [];if(!gameRunning||paused||endingGame)return currPhysicsSnapshot||world.snapshot();
-  const extra=Number(settings.extrapolation)||0;
-  if(isHost())return world.predictedSnapshot(clamp(accumulator*1000,0,17)+extra,lastActions);
-  const age=clamp(performance.now()-lastNetSnapshotAt,0,80);return world.predictedSnapshot(age+extra,lastActions);
+  const extra=Number(settings.extrapolation)||0;let snap;
+  if(isHost())snap=world.predictedSnapshot(clamp(accumulator*1000,0,17)+extra,lastActions);
+  else{const age=clamp(performance.now()-lastNetSnapshotAt,0,80);snap=world.predictedSnapshot(age+extra,lastActions);}
+  return smoothLocalPlayerSnapshot(snap);
 }
 // Camera presentation state. Physics remain at 60 Hz; this only affects how the
 // viewport follows the local player/ball. Large stadiums need a stable camera:
