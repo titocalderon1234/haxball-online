@@ -145,7 +145,7 @@ document.addEventListener('visibilitychange',reportPageVisibility);
 function makeGamePacket(){
   if(!world)return null;const snap=world.snapshot();return {t:'s',tick:world.steps,running:gameRunning,paused,overtime,elapsedTicks,redScore:world.redScore,blueScore:world.blueScore,state:world.state,kickingTeam:world.kickingTeam,goalTimer:world.goalTimer,goalScoringTeam,ending:endingGame,finalWinner,discs:snap.map(d=>[d.x,d.y,d.vx,d.vy,d.r]),kickFlags:world.kickFlag.slice()};
 }
-function sendHostSnapshot(force=false,onlyLink=null){if(!isHost()||!world)return;const pkt=makeGamePacket();if(!pkt)return;lastNetPacket=pkt;prevPhysicsSnapshot=currPhysicsSnapshot||world.snapshot();currPhysicsSnapshot=world.snapshot();lastNetSnapshotAt=performance.now();const links=onlyLink?[onlyLink]:[...peerLinks.values()];for(const l of links)safeDcSend(l.dc,pkt);if(force)updateHud();}
+function sendHostSnapshot(force=false,onlyLink=null){if(!isHost()||!world)return;const pkt=makeGamePacket();if(!pkt)return;lastNetPacket=pkt;prevPhysicsSnapshot=currPhysicsSnapshot||world.snapshot();currPhysicsSnapshot=world.snapshot();lastNetSnapshotAt=performance.now();const links=onlyLink?[onlyLink]:[...peerLinks.values()];for(const l of links)safeDcSend(l.dc,pkt);updateHud();}
 function botAction(p){
   if(!world)return [0,0,0];const i=world.playerIndexById.get(p.id);if(i==null)return [0,0,0];const d=world.discs[i],b=world.discs[0],attack=p.team===1?1:-1,dist=Math.sqrt((b.pos[0]-d.pos[0])**2+(b.pos[1]-d.pos[1])**2);let tx,ty;
   if(world.state===E.STATE_KICKOFF&&world.kickingTeam!==d.team){tx=p.team===1?-world.spawnDistance:world.spawnDistance;ty=0;}else{tx=b.pos[0]-attack*24;ty=b.pos[1];}
