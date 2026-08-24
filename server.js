@@ -56,7 +56,7 @@ function broadcastRooms(){io.emit('rooms:list',publicRooms());}
 function serializePlayer(p){return {id:p.id,peerId:p.socketId||null,name:p.name,avatar:p.avatar,team:p.team,admin:!!p.admin,bot:!!p.bot,ping:p.ping|0};}
 function serializeRoom(room){return {
   id:room.id,name:room.name,maxPlayers:room.maxPlayers,unlisted:room.unlisted,hasPassword:!!room.password,
-  ownerPlayerId:room.ownerPlayerId,hostPeerId:room.ownerSocketId,players:room.players.map(serializePlayer),teamsLocked:room.teamsLocked,
+  ownerPlayerId:room.ownerPlayerId,hostPeerId:room.hostSocketId||room.ownerSocketId,players:room.players.map(serializePlayer),teamsLocked:room.teamsLocked,
   stadiumKey:room.stadiumKey,stadium:clone(stadiumFor(room)),timeLimit:room.timeLimit,scoreLimit:room.scoreLimit,teamKits:clone(room.teamKits),
   game:{running:room.gameRunning,paused:room.paused,overtime:room.overtime,elapsedTicks:room.elapsedTicks,ending:room.endingGame,finalWinner:room.finalWinner}
 };}
@@ -69,14 +69,14 @@ function playerSocket(room,p){return p?.socketId?io.sockets.sockets.get(p.socket
 function isSocketInRoom(target,room){return !!target&&target.data.roomId===room.id;}
 
 function createPlayer(room,socket,nick,avatar,admin=false,bot=false){
-  const p={id:room.nextPlayerId++,socketId:bot?null:socket.id,name:cleanNick(nick),avatar:cleanAvatar(avatar),team:0,admin:!!admin,bot:!!bot,ping:0};
+  const p={id:room.nextPlayerId++,socketId:bot?null:socket.id,name:cleanNick(nick),avatar:cleanAvatar(avatar),team:0,admin:!!admin,bot:!!bot,ping:0,visible:true};
   room.players.push(p);return p;
 }
 function newRoom(socket,data){
   const id=makeId();
   const room={
     id,name:cleanText(data?.name,40)||'Sala',maxPlayers:clamp(Number(data?.maxPlayers)||8,2,22),password:cleanText(data?.password,30),unlisted:!!data?.unlisted,
-    ownerSocketId:socket.id,ownerPlayerId:null,nextPlayerId:1,players:[],bannedNames:new Set(),teamsLocked:false,
+    ownerSocketId:socket.id,hostSocketId:socket.id,ownerPlayerId:null,nextPlayerId:1,players:[],bannedNames:new Set(),teamsLocked:false,
     stadiumKey:'classic',customStadium:null,timeLimit:3,scoreLimit:3,teamKits:clone(DEFAULT_TEAM_KITS),
     gameRunning:false,paused:false,overtime:false,elapsedTicks:0,endingGame:false,finalWinner:0,endTimer:null
   };
@@ -109,8 +109,23 @@ function finishGame(room,team){
   room.gameRunning=false;room.paused=false;room.endingGame=true;room.finalWinner=team;broadcastRoomState(room);
   room.endTimer=setTimeout(()=>{const r=rooms.get(room.id);if(!r||!r.endingGame)return;r.endingGame=false;r.finalWinner=0;r.elapsedTicks=0;r.overtime=false;r.endTimer=null;broadcastRoomState(r);},1900);
 }
+function pickHostCandidate(room,excludeSocketId=null,visibleOnly=true){
+  const candidates=room.players.filter(p=>!p.bot&&p.socketId&&p.socketId!==excludeSocketId&&io.sockets.sockets.has(p.socketId)&&(!visibleOnly||p.visible!==false));
+  candidates.sort((a,b)=>(a.ping|0)-(b.ping|0)||a.id-b.id);
+  return candidates[0]||null;
+}
+function migrateHost(room,excludeSocketId=null,allowHiddenFallback=false){
+  let next=pickHostCandidate(room,excludeSocketId,true);
+  if(!next&&allowHiddenFallback)next=pickHostCandidate(room,excludeSocketId,false);
+  if(!next)return false;
+  if(room.hostSocketId===next.socketId)return false;
+  room.hostSocketId=next.socketId;
+  return true;
+}
 function removePlayer(room,p,reason='leave'){
-  if(!p)return;room.players=room.players.filter(x=>x.id!==p.id);if(reason==='leave')emitSystem(room,`${p.name} abandonó la sala.`);broadcastRoomState(room);
+  if(!p)return;const wasHost=room.hostSocketId===p.socketId;room.players=room.players.filter(x=>x.id!==p.id);
+  if(wasHost)migrateHost(room,p.socketId,true);
+  if(reason==='leave')emitSystem(room,`${p.name} abandonó la sala.`);broadcastRoomState(room);
 }
 async function closeRoom(room,message='El host cerró la sala.',excludeSocketId=null){
   if(room.endTimer)clearTimeout(room.endTimer);rooms.delete(room.id);const ids=[...(io.sockets.adapter.rooms.get(roomChannel(room.id))||[])];
@@ -123,12 +138,12 @@ async function leaveCurrentRoom(socket,reason='leave'){
 }
 function relayRtc(socket,event,data){
   const room=getRoom(socket);if(!room)return;const target=io.sockets.sockets.get(String(data?.target||''));if(!isSocketInRoom(target,room))return;
-  if(event==='rtc:offer'&&socket.id!==room.ownerSocketId)return;
-  if(event==='rtc:answer'&&target.id!==room.ownerSocketId)return;
+  if(event==='rtc:offer'&&socket.id!==(room.hostSocketId||room.ownerSocketId))return;
+  if(event==='rtc:answer'&&target.id!==(room.hostSocketId||room.ownerSocketId))return;
   target.emit(event,{from:socket.id,sdp:data?.sdp||null,candidate:data?.candidate||null});
 }
 
-app.get('/healthz',(req,res)=>res.json({ok:true,rooms:rooms.size,mode:'webrtc-host-authoritative',uptime:process.uptime()}));
+app.get('/healthz',(req,res)=>res.json({ok:true,rooms:rooms.size,mode:'webrtc-host-authoritative-migrating',uptime:process.uptime()}));
 
 io.on('connection',socket=>{
   socket.emit('rooms:list',publicRooms());
@@ -148,6 +163,15 @@ io.on('connection',socket=>{
   socket.on('rtc:ice',data=>relayRtc(socket,'rtc:ice',data));
 
   socket.on('player:ping',data=>{const room=getRoom(socket),p=getActor(socket,room);if(!p)return;p.ping=clamp(Number(data?.ping)||0,0,9999)|0;});
+  socket.on('player:visibility',data=>{
+    const room=getRoom(socket),p=getActor(socket,room);if(!room||!p||p.bot)return;
+    p.visible=!!data?.visible;
+    const currentHost=room.players.find(x=>x.socketId===(room.hostSocketId||room.ownerSocketId));
+    let changed=false;
+    if(socket.id===(room.hostSocketId||room.ownerSocketId)&&!p.visible)changed=migrateHost(room,socket.id,false);
+    else if(p.visible&&(!currentHost||currentHost.visible===false)&&room.hostSocketId!==socket.id){room.hostSocketId=socket.id;changed=true;}
+    if(changed)broadcastRoomState(room);
+  });
   socket.on('net:ping',(t,ack)=>{if(typeof ack==='function')ack(t);});
   socket.on('chat:send',data=>{const room=getRoom(socket),p=getActor(socket,room);if(!room||!p)return;const text=cleanText(data?.text,140);if(!text)return;io.to(roomChannel(room.id)).emit('chat:message',{type:p.team===1?'red':p.team===2?'blue':'system',text,name:p.name,playerId:p.id,ts:Date.now()});});
   socket.on('profile:update',(data,ack=()=>{})=>{const room=getRoom(socket),p=getActor(socket,room);if(!room||!p)return ack({ok:false});p.name=cleanNick(data?.name??p.name);p.avatar=cleanAvatar(data?.avatar??p.avatar);broadcastRoomState(room);ack({ok:true});});
@@ -158,8 +182,8 @@ io.on('connection',socket=>{
   socket.on('room:setLimits',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.timeLimit=clamp(Number(data?.timeLimit)||0,0,10);room.scoreLimit=clamp(Number(data?.scoreLimit)||0,0,10);broadcastRoomState(room);ack({ok:true});});
   socket.on('room:setStadium',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});if(room.gameRunning)return ack({ok:false,error:'Detené la partida primero.'});const key=String(data?.key||'classic');if(key==='custom'){try{const raw=data?.stadium;if(JSON.stringify(raw).length>400000)throw new Error('Mapa demasiado grande');room.customStadium=E.validateStadium(clone(raw));room.stadiumKey='custom';}catch(err){return ack({ok:false,error:err.message||'Mapa inválido.'});}}else if(['classic','small','big',...Object.keys(BUILTINS)].includes(key)){room.stadiumKey=key;room.customStadium=null;}else return ack({ok:false,error:'Estadio inválido.'});broadcastRoomState(room);ack({ok:true});});
   socket.on('room:gameAction',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});const action=String(data?.action||'');if(action==='start'){if(room.gameRunning)return ack({ok:false});startGame(room,actor);ack({ok:true});}else if(action==='stop'){stopGame(room,actor,true);ack({ok:true});}else if(action==='pause'){if(!room.gameRunning)return ack({ok:false});room.paused=!room.paused;emitSystem(room,room.paused?`Partida pausada por ${actor.name}.`:`Partida reanudada por ${actor.name}.`);broadcastRoomState(room);ack({ok:true});}else ack({ok:false});});
-  socket.on('room:hostMeta',(data,ack=()=>{})=>{const room=getRoom(socket);if(!room||socket.id!==room.ownerSocketId)return ack({ok:false});room.elapsedTicks=Math.max(0,Number(data?.elapsedTicks)||0)|0;room.overtime=!!data?.overtime;ack({ok:true});});
-  socket.on('room:hostFinish',(data,ack=()=>{})=>{const room=getRoom(socket);if(!room||socket.id!==room.ownerSocketId)return ack({ok:false});const team=Number(data?.team);if(team!==1&&team!==2)return ack({ok:false});finishGame(room,team);ack({ok:true});});
+  socket.on('room:hostMeta',(data,ack=()=>{})=>{const room=getRoom(socket);if(!room||socket.id!==(room.hostSocketId||room.ownerSocketId))return ack({ok:false});room.elapsedTicks=Math.max(0,Number(data?.elapsedTicks)||0)|0;room.overtime=!!data?.overtime;ack({ok:true});});
+  socket.on('room:hostFinish',(data,ack=()=>{})=>{const room=getRoom(socket);if(!room||socket.id!==(room.hostSocketId||room.ownerSocketId))return ack({ok:false});const team=Number(data?.team);if(team!==1&&team!==2)return ack({ok:false});finishGame(room,team);ack({ok:true});});
   socket.on('room:setPassword',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.password=cleanText(data?.password,30);broadcastRoomState(room);ack({ok:true});});
   socket.on('room:clearBans',(_,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.bannedNames.clear();ack({ok:true});});
   socket.on('room:partido',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});const id=String(data?.id||'').toLowerCase();if(id==='normal')room.teamKits=clone(DEFAULT_TEAM_KITS);else if(PARTIDOS[id])room.teamKits={1:clone(PARTIDOS[id].red),2:clone(PARTIDOS[id].blue)};else return ack({ok:false,error:'Partido desconocido.'});broadcastRoomState(room);ack({ok:true,name:id==='normal'?'Normal':PARTIDOS[id].name});});
