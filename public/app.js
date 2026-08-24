@@ -237,8 +237,8 @@ socket.on('room:kicked',data=>{alert(data?.ban?'Fuiste baneado de la sala.':'Fui
 socket.on('chat:message',m=>{if(!m)return;addChat(m.text||'',m.type||'system',m.name||'');});
 // El ping mostrado durante una sala se mide directo contra el host por WebRTC.
 /* ---------- room ---------- */
-function currentActiveSignature(){return players.filter(p=>p.team===1||p.team===2).map(p=>p.id).join(',');}
-function worldActiveSignature(){return world?.players?.map(p=>p.id).join(',')||'';}
+function currentActiveSignature(){return players.filter(p=>p.team===1||p.team===2).map(p=>`${p.id}:${p.team}`).join(',');}
+function worldActiveSignature(){return world?.players?.map(p=>`${p.id}:${p.team}`).join(',')||'';}
 function ensureGameWorld(force=false,oldWorld=null){
   if(force)resetVisualLocalPlayer();
   if(!(gameRunning||endingGame)){world=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;lastNetPacket=null;resetVisualLocalPlayer();return;}
@@ -449,20 +449,28 @@ function blendSnapshots(a,b,t){
 }
 const visualLocalPlayer={x:0,y:0,vx:0,vy:0,ready:false,lastTime:0,key:''};
 function resetVisualLocalPlayer(){visualLocalPlayer.ready=false;visualLocalPlayer.lastTime=0;visualLocalPlayer.key='';}
+function cameraCanScroll(st=selectedStadium){
+  if(!st||settings.view==='fit')return false;
+  const cw=canvas?._cw||innerWidth,ch=canvas?._ch||innerHeight,w=Number(st.width)||420,h=Number(st.height)||200;
+  let scale=parseFloat(settings.view)||1;const maxViewWidth=Number(st.maxViewWidth)||0;if(maxViewWidth>0)scale=Math.max(scale,cw/maxViewWidth);
+  return cw/(2*scale)<w||ch/(2*scale)<h;
+}
 function smoothLocalPlayerSnapshot(snap){
-  // Solo suaviza la presentación del jugador local. La física y el valor de
-  // Extrapolation siguen siendo exactamente los mismos.
-  const extra=Number(settings.extrapolation)||0,w=Number(selectedStadium?.width)||0,h=Number(selectedStadium?.height)||0;
-  if(isHost()||!world||!gameRunning||paused||endingGame||extra<=0||(w<700&&h<320)){resetVisualLocalPlayer();return snap;}
+  // Esta capa es SOLO visual: no cambia la física ni el valor de Extrapolation.
+  // Se aplica también al host y aun con Extrapolation=0 cuando la cámara debe
+  // desplazarse. Así las correcciones de red / ticks de 60 Hz no sacuden la cámara.
+  if(!world||!gameRunning||paused||endingGame||!cameraCanScroll()){resetVisualLocalPlayer();return snap;}
   const me=human(),idx=me&&world.playerIndexById.get(me.id),target=(idx!=null?snap?.[idx]:null);if(!target){resetVisualLocalPlayer();return snap;}
-  const now=performance.now(),key=`${room.id||''}|${selectedStadiumKey}|${me.id}`;
+  const now=performance.now(),key=`${room.id||''}|${selectedStadiumKey}|${me.id}|${settings.view}`;
   if(!visualLocalPlayer.ready||visualLocalPlayer.key!==key){visualLocalPlayer.x=target.x;visualLocalPlayer.y=target.y;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;visualLocalPlayer.ready=true;visualLocalPlayer.key=key;visualLocalPlayer.lastTime=now;return snap;}
-  const dt=Math.min(.04,Math.max(0,(now-visualLocalPlayer.lastTime)/1000));visualLocalPlayer.lastTime=now;
+  const dt=Math.min(.05,Math.max(0,(now-visualLocalPlayer.lastTime)/1000));visualLocalPlayer.lastTime=now;
   const dx=target.x-visualLocalPlayer.x,dy=target.y-visualLocalPlayer.y,dist2=dx*dx+dy*dy;
-  if(dist2>3600){visualLocalPlayer.x=target.x;visualLocalPlayer.y=target.y;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;}
+  if(dist2>6400){visualLocalPlayer.x=target.x;visualLocalPlayer.y=target.y;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;}
   else{
+    // Avanza con la velocidad prevista y absorbe gradualmente la corrección del
+    // snapshot autoritativo. El jugador no queda "gomoso", pero desaparece el salto.
     visualLocalPlayer.x+=target.vx*dt*60;visualLocalPlayer.y+=target.vy*dt*60;
-    const ex=target.x-visualLocalPlayer.x,ey=target.y-visualLocalPlayer.y,k=1-Math.exp(-dt*28);
+    const ex=target.x-visualLocalPlayer.x,ey=target.y-visualLocalPlayer.y,k=1-Math.exp(-dt*22);
     visualLocalPlayer.x+=ex*k;visualLocalPlayer.y+=ey*k;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;
   }
   const out=snap.slice();out[idx]=Object.assign({},target,{x:visualLocalPlayer.x,y:visualLocalPlayer.y});return out;
@@ -541,7 +549,7 @@ function camera(st,snap){
     }else{
       // Slightly slower than V12. The local player remains responsive because it is
       // already frame-interpolated; this filter mainly removes camera micro-jitter.
-      const k=1-Math.exp(-dt*21);
+      const k=1-Math.exp(-dt*16);
       if(movingX)visualCamera.x+=dx*k;else visualCamera.x=target[0];
       if(movingY)visualCamera.y+=dy*k;else visualCamera.y=target[1];
     }
@@ -576,13 +584,13 @@ function getStadiumFloor(img,type,bg){
 }
 function drawWorldTiles(ctx,img,bg,cam,sx,sy){
   const floor=getStadiumFloor(img,bg.type||'none',bg);if(!floor)return;
-  const dpr=Math.min(2,window.devicePixelRatio||1);
-  // Align only the texture to physical pixels. Stadium geometry and players keep the
-  // smooth sub-pixel camera, while the repeating grass/hockey texture no longer
-  // shimmers as the camera pans. The max correction is < 0.5 physical pixel.
-  const rawX=sx(-bg.width),rawY=sy(-bg.height),x=Math.round(rawX*dpr)/dpr,y=Math.round(rawY*dpr)/dpr;
-  const w=bg.width*2*cam.scale,h=bg.height*2*cam.scale,oldSmooth=ctx.imageSmoothingEnabled;
-  ctx.imageSmoothingEnabled=false;ctx.drawImage(floor.canvas,0,0,floor.worldW,floor.worldH,x,y,w,h);ctx.imageSmoothingEnabled=oldSmooth;
+  // La textura debe moverse con EXACTAMENTE la misma cámara sub-pixel que las líneas
+  // y los jugadores. Redondearla por separado hacía que el piso de futsal saltara
+  // entre píxeles y diera la sensación de que toda la pantalla vibraba.
+  const x=sx(-bg.width),y=sy(-bg.height),w=bg.width*2*cam.scale,h=bg.height*2*cam.scale;
+  const oldSmooth=ctx.imageSmoothingEnabled;ctx.imageSmoothingEnabled=true;
+  ctx.drawImage(floor.canvas,0,0,floor.worldW,floor.worldH,x,y,w,h);
+  ctx.imageSmoothingEnabled=oldSmooth;
 }
 function renderBackground(ctx,sx,sy,bg,cam,cw,ch){
   const type=bg.type||'none';
