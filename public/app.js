@@ -176,7 +176,22 @@ function hostActions(localAct){const m=new Map();for(const p of players){if(!(p.
 function rebuildHostWorld(oldWorld){
   const nw=new E.World(selectedStadium,players);if(!oldWorld)return nw;nw.redScore=oldWorld.redScore;nw.blueScore=oldWorld.blueScore;nw.state=oldWorld.state;nw.kickingTeam=oldWorld.kickingTeam;nw.goalTimer=oldWorld.goalTimer;nw.steps=oldWorld.steps;
   const non=Math.min(nw.firstPlayer,oldWorld.firstPlayer);for(let i=0;i<non;i++){nw.discs[i].pos=oldWorld.discs[i].pos.slice();nw.discs[i].vel=oldWorld.discs[i].vel.slice();}
-  for(const p of players){if(!(p.team===1||p.team===2))continue;const ni=nw.playerIndexById.get(p.id),oi=oldWorld.playerIndexById.get(p.id);if(ni==null||oi==null)continue;nw.discs[ni].pos=oldWorld.discs[oi].pos.slice();nw.discs[ni].vel=oldWorld.discs[oi].vel.slice();}
+  const oldPlayersById=new Map((oldWorld.players||[]).map(p=>[p.id,p]));
+  for(const p of players){
+    if(!(p.team===1||p.team===2))continue;
+    const ni=nw.playerIndexById.get(p.id),oi=oldWorld.playerIndexById.get(p.id);if(ni==null)continue;
+    const newDisc=nw.discs[ni],oldPlayer=oldPlayersById.get(p.id);
+    // La comparación de equipo se hace con el 1/2 de la sala, NO con los flags
+    // internos de física (RED=2 / BLUE=4). Si el jugador ya estaba activo y sigue
+    // en el mismo equipo, conserva su posición. Si entró desde espectadores o pasó
+    // Rojo <-> Azul, conserva el spawn que el nuevo World calculó para ese color.
+    if(oldPlayer&&oldPlayer.team===p.team&&oi!=null){
+      const oldDisc=oldWorld.discs[oi];newDisc.pos=oldDisc.pos.slice();newDisc.vel=oldDisc.vel.slice();
+    }else{
+      newDisc.vel=[0,0];
+      const k=ni-nw.firstPlayer;if(k>=0){nw.kickFlag[k]=false;nw.kickHeldPrev[k]=false;nw.kickCooldown[k]=0;nw.kickBurst[k]=0;}
+    }
+  }
   return nw;
 }
 function hostStep(localAct){
@@ -240,8 +255,7 @@ socket.on('chat:message',m=>{if(!m)return;addChat(m.text||'',m.type||'system',m.
 function currentActiveSignature(){return players.filter(p=>p.team===1||p.team===2).map(p=>`${p.id}:${p.team}`).join(',');}
 function worldActiveSignature(){return world?.players?.map(p=>`${p.id}:${p.team}`).join(',')||'';}
 function ensureGameWorld(force=false,oldWorld=null){
-  if(force)resetVisualLocalPlayer();
-  if(!(gameRunning||endingGame)){world=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;lastNetPacket=null;resetVisualLocalPlayer();return;}
+  if(!(gameRunning||endingGame)){world=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;lastNetPacket=null;return;}
   if(!force&&world&&worldActiveSignature()===currentActiveSignature())return;
   if(isHost()){
     world=oldWorld?rebuildHostWorld(oldWorld):new E.World(selectedStadium,players);
@@ -273,14 +287,14 @@ function applyRoomState(st){
   if(isHost()&&world&&(started||mustRebuild||wasPaused!==paused))setTimeout(()=>sendHostSnapshot(true),0);
 }
 function enterRoomState(st){
-  connectionInterruptedHandled=false;clearHostInterruptTimer();resetVisualLocalPlayer();
+  connectionInterruptedHandled=false;clearHostInterruptTimer();
   room={id:st.id,name:st.name,maxPlayers:st.maxPlayers,password:'',unlisted:st.unlisted,owned:myPlayerId===st.ownerPlayerId,hostPeerId:st.hostPeerId||null,timeLimit:st.timeLimit,scoreLimit:st.scoreLimit};
   closeAllRtc();players=[];world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;overtime=false;elapsedTicks=0;endingGame=false;finalWinner=0;goalScoringTeam=0;menuOpen=true;keys.clear();resetVisualCamera();
   clearChat();applyRoomState(st);if(settings.extrapolationTouched)addSystem(`Extrapolation: ${settings.extrapolation} ms.`);applySettingsToUI();resizeCanvas();show('gameView');setRoomMenu(!(gameRunning||endingGame));render();
   setTimeout(reportPageVisibility,0);
 }
 function resetToLobby(){
-  resetVisualLocalPlayer();closeAllRtc();room={id:null,name:'',maxPlayers:8,password:'',unlisted:false,owned:false,hostPeerId:null};players=[];myPlayerId=null;world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;endingGame=false;keys.clear();hidePlayerContext();show('roomsView');socket.emit('rooms:get');
+  closeAllRtc();room={id:null,name:'',maxPlayers:8,password:'',unlisted:false,owned:false,hostPeerId:null};players=[];myPlayerId=null;world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;endingGame=false;keys.clear();hidePlayerContext();show('roomsView');socket.emit('rooms:get');
 }
 function leaveRoom(){socket.emit('room:leave',{},()=>resetToLobby());}
 $('#leaveRoomBtn').onclick=leaveRoom;
@@ -447,40 +461,22 @@ function blendSnapshots(a,b,t){
   }
   return out;
 }
-const visualLocalPlayer={x:0,y:0,vx:0,vy:0,ready:false,lastTime:0,key:''};
-function resetVisualLocalPlayer(){visualLocalPlayer.ready=false;visualLocalPlayer.lastTime=0;visualLocalPlayer.key='';}
-function cameraCanScroll(st=selectedStadium){
-  if(!st||settings.view==='fit')return false;
-  const cw=canvas?._cw||innerWidth,ch=canvas?._ch||innerHeight,w=Number(st.width)||420,h=Number(st.height)||200;
-  let scale=parseFloat(settings.view)||1;const maxViewWidth=Number(st.maxViewWidth)||0;if(maxViewWidth>0)scale=Math.max(scale,cw/maxViewWidth);
-  return cw/(2*scale)<w||ch/(2*scale)<h;
-}
-function smoothLocalPlayerSnapshot(snap){
-  // Esta capa es SOLO visual: no cambia la física ni el valor de Extrapolation.
-  // Se aplica también al host y aun con Extrapolation=0 cuando la cámara debe
-  // desplazarse. Así las correcciones de red / ticks de 60 Hz no sacuden la cámara.
-  if(!world||!gameRunning||paused||endingGame||!cameraCanScroll()){resetVisualLocalPlayer();return snap;}
-  const me=human(),idx=me&&world.playerIndexById.get(me.id),target=(idx!=null?snap?.[idx]:null);if(!target){resetVisualLocalPlayer();return snap;}
-  const now=performance.now(),key=`${room.id||''}|${selectedStadiumKey}|${me.id}|${settings.view}`;
-  if(!visualLocalPlayer.ready||visualLocalPlayer.key!==key){visualLocalPlayer.x=target.x;visualLocalPlayer.y=target.y;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;visualLocalPlayer.ready=true;visualLocalPlayer.key=key;visualLocalPlayer.lastTime=now;return snap;}
-  const dt=Math.min(.05,Math.max(0,(now-visualLocalPlayer.lastTime)/1000));visualLocalPlayer.lastTime=now;
-  const dx=target.x-visualLocalPlayer.x,dy=target.y-visualLocalPlayer.y,dist2=dx*dx+dy*dy;
-  if(dist2>6400){visualLocalPlayer.x=target.x;visualLocalPlayer.y=target.y;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;}
-  else{
-    // Avanza con la velocidad prevista y absorbe gradualmente la corrección del
-    // snapshot autoritativo. El jugador no queda "gomoso", pero desaparece el salto.
-    visualLocalPlayer.x+=target.vx*dt*60;visualLocalPlayer.y+=target.vy*dt*60;
-    const ex=target.x-visualLocalPlayer.x,ey=target.y-visualLocalPlayer.y,k=1-Math.exp(-dt*22);
-    visualLocalPlayer.x+=ex*k;visualLocalPlayer.y+=ey*k;visualLocalPlayer.vx=target.vx;visualLocalPlayer.vy=target.vy;
-  }
-  const out=snap.slice();out[idx]=Object.assign({},target,{x:visualLocalPlayer.x,y:visualLocalPlayer.y});return out;
-}
 function currentSnapshot(){
   if(!world)return [];if(!gameRunning||paused||endingGame)return currPhysicsSnapshot||world.snapshot();
-  const extra=Number(settings.extrapolation)||0;let snap;
-  if(isHost())snap=world.predictedSnapshot(clamp(accumulator*1000,0,17)+extra,lastActions);
-  else{const age=clamp(performance.now()-lastNetSnapshotAt,0,80);snap=world.predictedSnapshot(age+extra,lastActions);}
-  return smoothLocalPlayerSnapshot(snap);
+  // Snapshot VISUAL de juego: respeta exactamente el extrapolation elegido. No se
+  // suaviza el jugador local ni se mezcla con una versión de 0 ms.
+  const extra=Number(settings.extrapolation)||0;
+  if(isHost())return world.predictedSnapshot(clamp(accumulator*1000,0,17)+extra,lastActions);
+  const age=clamp(performance.now()-lastNetSnapshotAt,0,80);return world.predictedSnapshot(age+extra,lastActions);
+}
+function currentCameraSnapshot(){
+  if(!world)return [];if(!gameRunning||paused||endingGame)return currPhysicsSnapshot||world.snapshot();
+  // La cámara usa la misma predicción temporal necesaria para dibujar entre ticks/
+  // paquetes, pero NUNCA suma el extrapolation del usuario. Así una corrección de
+  // 100/200/300 ms puede verse en tu disco (como en HaxBall) sin arrastrar con ella
+  // todo el estadio y producir la "vibración de pantalla".
+  if(isHost())return world.predictedSnapshot(clamp(accumulator*1000,0,17),lastActions);
+  const age=clamp(performance.now()-lastNetSnapshotAt,0,80);return world.predictedSnapshot(age,lastActions);
 }
 // Camera presentation state. Physics remain at 60 Hz; this only affects how the
 // viewport follows the local player/ball. Large stadiums need a stable camera:
@@ -549,7 +545,7 @@ function camera(st,snap){
     }else{
       // Slightly slower than V12. The local player remains responsive because it is
       // already frame-interpolated; this filter mainly removes camera micro-jitter.
-      const k=1-Math.exp(-dt*16);
+      const k=1-Math.exp(-dt*21);
       if(movingX)visualCamera.x+=dx*k;else visualCamera.x=target[0];
       if(movingY)visualCamera.y+=dy*k;else visualCamera.y=target[1];
     }
@@ -610,7 +606,7 @@ function renderBackground(ctx,sx,sy,bg,cam,cw,ch){
 }
 function render(){
   const cw=canvas._cw||innerWidth,ch=canvas._ch||innerHeight;ctx.setTransform(window.devicePixelRatio?Math.min(2,window.devicePixelRatio):1,0,0,window.devicePixelRatio?Math.min(2,window.devicePixelRatio):1,0,0);
-  const st=selectedStadium||E.CLASSIC,snap=currentSnapshot(),cam=camera(st,snap),sx=x=>cam.cx+x*cam.scale,sy=y=>cam.cy-y*cam.scale,syRaw=y=>cam.cy+y*cam.scale,bg=st.bg||{type:'grass',width:(st.width||420)-50,height:(st.height||200)-30,kickOffRadius:75};
+  const st=selectedStadium||E.CLASSIC,snap=currentSnapshot(),cameraSnap=currentCameraSnapshot(),cam=camera(st,cameraSnap),sx=x=>cam.cx+x*cam.scale,sy=y=>cam.cy-y*cam.scale,syRaw=y=>cam.cy+y*cam.scale,bg=st.bg||{type:'grass',width:(st.width||420)-50,height:(st.height||200)-30,kickOffRadius:75};
   // Stadium physics are mirrored to a Cartesian y-up engine. Mirror them back for
   // display; BackgroundObject itself remains in raw HaxBall y-down coordinates.
   renderBackground(ctx,sx,syRaw,bg,cam,cw,ch);
@@ -636,7 +632,9 @@ function render(){
     for(let i=world.firstPlayer;i<snap.length;i++){
       const d=snap[i],p=players.find(x=>x.id===d.playerId);if(!p)continue;
       const k=world.kickFlag[i-world.firstPlayer]||d.kick;if(k)drawKickEffect(d,snap[0],cam,sx,sy);
-      drawPlayerDisc(d,teamKits[d.team]||DEFAULT_TEAM_KITS[d.team]||DEFAULT_TEAM_KITS[1],cam,sx,sy,p.avatar||String(p.id));
+      // p.team usa el contrato de sala (1=Rojo, 2=Azul). d.team usa flags de
+      // física (2=RED, 4=BLUE), por eso usar d.team como índice invertía los kits.
+      drawPlayerDisc(d,teamKits[p.team]||DEFAULT_TEAM_KITS[p.team]||DEFAULT_TEAM_KITS[1],cam,sx,sy,p.avatar||String(p.id));
       if(settings.showNames){const fs=clamp(11*cam.scale,10,15);ctx.font=`${fs}px Arial`;ctx.textAlign='center';ctx.textBaseline='top';ctx.lineWidth=3;ctx.strokeStyle='rgba(0,0,0,.72)';ctx.fillStyle='#fff';const yy=sy(d.y-d.r)+4;ctx.strokeText(p.name,sx(d.x),yy);ctx.fillText(p.name,sx(d.x),yy);}
     }
   }
