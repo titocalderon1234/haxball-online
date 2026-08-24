@@ -131,6 +131,17 @@ function handleHostData(link,m){
 }
 function startDirectPing(){if(isHost()){myPing=0;return;}if(!dcOpen(hostLink?.dc))return;hostLink.pingSeq=(hostLink.pingSeq||0)+1;safeDcSend(hostLink.dc,{t:'p',n:hostLink.pingSeq,ts:performance.now()});}
 setInterval(()=>{if(!room.id)return;if(isHost()){myPing=0;$('#pingHud').textContent='Ping: 0';socket.emit('player:ping',{ping:0});}else startDirectPing();},900);
+function reportPageVisibility(){
+  if(!room.id)return;
+  const visible=!document.hidden;
+  if(!visible){
+    keys.clear();
+    if(isHost())sendHostSnapshot(true);
+    else if(dcOpen(hostLink?.dc)){inputSeq++;safeDcSend(hostLink.dc,{t:'i',x:0,y:0,k:false,seq:inputSeq});lastSentInput='0,0,0';}
+  }
+  socket.emit('player:visibility',{visible});
+}
+document.addEventListener('visibilitychange',reportPageVisibility);
 function makeGamePacket(){
   if(!world)return null;const snap=world.snapshot();return {t:'s',tick:world.steps,running:gameRunning,paused,overtime,elapsedTicks,redScore:world.redScore,blueScore:world.blueScore,state:world.state,kickingTeam:world.kickingTeam,goalTimer:world.goalTimer,goalScoringTeam,ending:endingGame,finalWinner,discs:snap.map(d=>[d.x,d.y,d.vx,d.vy,d.r]),kickFlags:world.kickFlag.slice()};
 }
@@ -243,6 +254,7 @@ function enterRoomState(st){
   room={id:st.id,name:st.name,maxPlayers:st.maxPlayers,password:'',unlisted:st.unlisted,owned:myPlayerId===st.ownerPlayerId,hostPeerId:st.hostPeerId||null,timeLimit:st.timeLimit,scoreLimit:st.scoreLimit};
   closeAllRtc();players=[];world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;overtime=false;elapsedTicks=0;endingGame=false;finalWinner=0;goalScoringTeam=0;menuOpen=true;keys.clear();resetVisualCamera();
   clearChat();applyRoomState(st);if(settings.extrapolationTouched)addSystem(`Extrapolation: ${settings.extrapolation} ms.`);applySettingsToUI();resizeCanvas();show('gameView');setRoomMenu(!(gameRunning||endingGame));render();
+  setTimeout(reportPageVisibility,0);
 }
 function resetToLobby(){
   closeAllRtc();room={id:null,name:'',maxPlayers:8,password:'',unlisted:false,owned:false,hostPeerId:null};players=[];myPlayerId=null;world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;endingGame=false;keys.clear();hidePlayerContext();show('roomsView');socket.emit('rooms:get');
