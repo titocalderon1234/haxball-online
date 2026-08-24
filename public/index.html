@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>HB Online</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="root">
+  <nav id="siteNav" class="site-nav">
+    <strong>HB ONLINE</strong><span>Noticias</span><span class="active">Jugar</span><span>Acerca de</span><span>Comunidad</span>
+  </nav>
+  <!-- Startup nickname dialog -->
+  <section id="nickView" class="front-screen">
+    <div class="nick-stack">
+      <div class="local-logo"><span>HB</span><b>ONLINE</b></div>
+      <div class="dialog nick-dialog">
+        <h1>Elegí tu apodo</h1>
+        <div class="label-input"><label>Apodo:</label><input id="nickInput" maxlength="25" autocomplete="off"></div>
+        <button id="nickOk" class="hb-button primary">Aceptar</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Interface 1: Room list -->
+  <section id="roomsView" class="front-screen hidden">
+    <div class="room-list-shell">
+      <header class="room-list-head">
+        <h1>Lista de salas</h1>
+        <div id="roomStats">1 jugador en 1 sala</div>
+      </header>
+      <div class="hint">Entrá a salas cercanas para tener menor ping.</div>
+      <div class="room-browser">
+        <div class="room-list-left">
+          <div class="room-table-wrap">
+            <div class="room-table-header">
+              <span>Nombre de sala</span><span>Jugadores</span><span>Clave</span><span>Distancia</span>
+            </div>
+            <div id="roomRows" class="room-rows" tabindex="0"></div>
+          </div>
+          <div class="room-filters">
+            <label class="checkbox-row"><input id="showLockedRooms" type="checkbox" checked> Mostrar con clave</label>
+            <label class="checkbox-row"><input id="showFullRooms" type="checkbox" checked> Mostrar llenas</label>
+            <label class="checkbox-row"><input id="showEmptyRooms" type="checkbox" checked> Mostrar vacías</label>
+          </div>
+        </div>
+        <aside class="room-list-actions">
+          <button id="refreshRooms" class="hb-button">↻ &nbsp;Actualizar</button>
+          <button id="joinRoom" class="hb-button">↪ &nbsp;Entrar</button>
+          <button id="openCreate" class="hb-button">＋ Crear sala</button>
+          <div class="actions-spacer"></div>
+          <button id="replaysBtn" class="hb-button">▶ &nbsp;Repeticiones</button>
+          <button id="optionsFromLobby" class="hb-button">⚙ &nbsp;Opciones</button>
+          <button id="logoutBtn" class="hb-button">↻ &nbsp;Cambiar apodo</button>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <!-- Interface 2: Create room -->
+  <section id="createView" class="front-screen hidden">
+    <div class="dialog create-dialog">
+      <h1>Crear sala</h1>
+      <div class="label-input"><label>Nombre:</label><input id="createName" maxlength="40"></div>
+      <div class="label-input"><label>Contraseña:</label><input id="createPass" maxlength="30" type="password"></div>
+      <div class="label-input"><label>Máx. jugadores:</label><select id="createMax"></select></div>
+      <button id="unlistedBtn" class="hb-button toggle-button" data-unlisted="false">Mostrar en la lista: Sí</button>
+      <div class="dialog-row"><button id="cancelCreate" class="hb-button">Cancelar</button><button id="createConfirm" class="hb-button primary">Crear</button></div>
+    </div>
+  </section>
+
+  <!-- Interface 3: Room/game. Game stays visible behind the ESC room menu. -->
+  <section id="gameView" class="game-screen hidden">
+    <canvas id="gameCanvas"></canvas>
+
+    <div id="scoreHud" class="score-hud">
+      <div class="score-side red-side"><span id="redScore">0</span><i></i></div>
+      <div class="clock"><span id="clockText">00:00</span><small id="overtimeText" class="hidden">OT</small></div>
+      <div class="score-side blue-side"><i></i><span id="blueScore">0</span></div>
+    </div>
+
+    <div class="top-right-controls">
+      <div class="volume-control"><span>🔊</span><input id="volumeSlider" type="range" min="0" max="100" value="70"></div>
+      <button id="roomMenuBtn" class="icon-button" title="Menú de sala">☰</button>
+      <button id="settingsBtn" class="icon-button" title="Opciones">⚙</button>
+    </div>
+
+    <div id="kickHint" class="kick-hint">¡Presioná X para patear!</div>
+
+    <div id="gameAnnouncement" class="game-announcement hidden" aria-live="polite">
+      <div id="gameAnnouncementText" class="game-announcement-text"></div>
+    </div>
+
+    <!-- HaxBall-style translucent chat; no Send button. -->
+    <div id="chatPanel" class="chat-panel">
+      <div id="chatResize" class="chat-resize" title="Arrastrá para cambiar el tamaño"></div>
+      <div id="chatLog" class="chat-log"></div>
+      <input id="chatInput" class="chat-input" maxlength="140" autocomplete="off" placeholder="Presioná [TAB] o [ENTER] para escribir.">
+    </div>
+    <div id="pingHud" class="ping-hud">Ping: 0</div>
+
+    <!-- ESC room menu, field continues underneath -->
+    <div id="roomMenu" class="room-menu-backdrop">
+      <div class="room-menu-panel">
+        <div class="room-menu-titlebar">
+          <strong id="roomTitle">My room</strong>
+          <div class="room-title-actions">
+            <button id="recBtn" class="hax-blue-button compact">● Grabar</button>
+            <button id="linkBtn" class="hax-blue-button compact">🔗 Enlace</button>
+            <button id="leaveRoomBtn" class="hax-blue-button compact">↪ Salir</button>
+          </div>
+        </div>
+
+        <div class="room-menu-main">
+          <div class="host-stack" aria-label="Host controls">
+            <button id="autoTeams" class="hax-blue-button">Auto</button>
+            <button id="randTeams" class="hax-blue-button">Rand</button>
+            <button id="lockTeams" class="hax-blue-button">🔓 Bloquear</button>
+            <button id="resetTeams" class="hax-blue-button">Reiniciar</button>
+          </div>
+
+          <div class="team-column red-column" data-team="1">
+            <div class="team-header"><span>Rojo</span><button class="team-switch" data-team="1">▶</button></div>
+            <div id="redPlayers" class="player-list"></div>
+          </div>
+          <div class="team-column spec-column" data-team="0">
+            <div class="team-header"><span>Espectadores</span></div>
+            <div id="specPlayers" class="player-list"></div>
+          </div>
+          <div class="team-column blue-column" data-team="2">
+            <div class="team-header"><button class="team-switch" data-team="2">◀</button><span>Azul</span></div>
+            <div id="bluePlayers" class="player-list"></div>
+          </div>
+        </div>
+
+        <div class="match-settings">
+          <div class="match-settings-grid">
+            <label for="timeLimit">Límite de tiempo</label><select id="timeLimit"></select><span></span>
+            <label for="scoreLimit">Límite de goles</label><select id="scoreLimit"></select><span></span>
+            <label>Estadio</label><strong id="stadiumCurrent">Clásico</strong><button id="stadiumPickBtn" class="hax-blue-button compact">Elegir</button>
+          </div>
+          <button id="startStop" class="hax-start-button">▶ Iniciar partida</button>
+        </div>
+
+        <div class="local-room-note">PRÁCTICA LOCAL · El rival CPU es solo para probar offline</div>
+        <select id="stadiumSelect" class="hidden"><option value="classic">Clásico</option><option value="small">Pequeño</option><option value="big">Grande</option><option value="futsal12">Futsal x1/x2</option><option value="futsal3">Futsal x3</option><option value="futsal4">Futsal x4</option><option value="futsal5">Futsal x5 GLH</option><option value="futsal7">Futsal x7</option><option value="custom">Personalizado...</option></select>
+        <button id="addRedBot" class="hidden" tabindex="-1">+ CPU Rojo</button>
+        <button id="addBlueBot" class="hidden" tabindex="-1">+ CPU Azul</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Admin player context menu (right click) -->
+  <div id="playerContext" class="player-context hidden" role="menu" aria-label="Acciones del jugador">
+    <div id="ctxPlayerName" class="player-context-title"></div>
+    <button data-action="admin">Dar admin</button>
+    <div class="context-separator"></div>
+    <button data-action="red">Mover a Rojo</button>
+    <button data-action="spec">Mover a Espectadores</button>
+    <button data-action="blue">Mover a Azul</button>
+    <div class="context-separator"></div>
+    <button data-action="kick" class="danger">Expulsar</button>
+    <button data-action="ban" class="danger">Banear</button>
+  </div>
+
+  <div id="stadiumModal" class="modal-backdrop hidden">
+    <div class="stadium-dialog">
+      <div class="settings-head"><h1>Elegir estadio</h1><button id="closeStadium" class="close-x">×</button></div>
+      <div class="stadium-grid">
+        <button class="stadium-choice selected" data-stadium="classic"><b>Clásico</b><span>Predeterminado</span></button>
+        <button class="stadium-choice" data-stadium="small"><b>Pequeño</b><span>Predeterminado</span></button>
+        <button class="stadium-choice" data-stadium="big"><b>Grande</b><span>Predeterminado</span></button>
+        <button class="stadium-choice" data-stadium="futsal12"><b>Futsal x1/x2</b><span>Bazinga &amp; GLH · HaxMaps</span></button>
+        <button class="stadium-choice" data-stadium="futsal3"><b>Futsal x3</b><span>Bazinga · HaxMaps</span></button>
+        <button class="stadium-choice" data-stadium="futsal4"><b>Futsal x4</b><span>Bazinga · HaxMaps</span></button>
+        <button class="stadium-choice" data-stadium="futsal5"><b>Futsal x5 GLH</b><span>Bazinga · HaxMaps</span></button>
+        <button class="stadium-choice" data-stadium="futsal7"><b>Futsal x7</b><span>Bazinga · HaxMaps</span></button>
+        <button class="stadium-choice load-choice" data-stadium="custom"><b>Cargar</b><span>archivo .hbs</span></button>
+      </div>
+      <div class="stadium-foot">Los estadios predeterminados se cargan localmente. Podés elegir archivos .hbs personalizados.</div>
+    </div>
+  </div>
+
+  <!-- Options/settings -->
+  <div id="settingsModal" class="modal-backdrop hidden">
+    <div class="settings-dialog">
+      <div class="settings-head"><h1>Opciones</h1><button id="closeSettings" class="close-x">×</button></div>
+      <div class="settings-tabs">
+        <button class="settings-tab active" data-tab="general">General</button>
+        <button class="settings-tab" data-tab="video">Video</button>
+        <button class="settings-tab" data-tab="input">Controles</button>
+      </div>
+      <div class="settings-page" data-page="general">
+        <div class="label-input"><label>Apodo:</label><input id="setNick" maxlength="25"></div>
+        <div class="label-input"><label>Avatar:</label><input id="setAvatar" maxlength="2"></div>
+        <div class="label-input"><label>Extrapolation:</label><div class="inline-number"><input id="setExtrap" type="number" min="0" max="1000" step="1"><span>ms</span></div></div>
+        <label class="checkbox-row"><input id="setShowChat" type="checkbox"> Mostrar chat</label>
+        <label class="checkbox-row"><input id="setShowNames" type="checkbox"> Mostrar nombres</label>
+        <label class="checkbox-row"><input id="setSound" type="checkbox"> Sonido</label>
+        <label class="checkbox-row"><input id="setLowLatency" type="checkbox"> Usar canvas de baja latencia</label>
+      </div>
+      <div class="settings-page hidden" data-page="video">
+        <div class="label-input"><label>Vista:</label><select id="setView"><option value="1">1.00x (HaxBall)</option><option value="1.25">1.25x</option><option value="1.5">1.50x</option><option value="1.75">1.75x</option><option value="fit">Ver estadio completo</option></select></div>
+        <div class="label-input"><label>FPS:</label><select id="setFps"><option value="0">Frecuencia de pantalla (recomendado)</option><option value="60">60</option><option value="120">120</option></select></div>
+        <div class="label-input"><label>Opacidad del chat:</label><input id="setChatOpacity" type="range" min="20" max="95" step="1"></div>
+        <div class="label-input"><label>Ancho del fondo del chat:</label><select id="setChatWidth"><option value="compact">Compacto</option><option value="full">Completo</option></select></div>
+        <div class="label-input"><label>Altura del chat al escribir:</label><input id="setChatHeight" type="range" min="140" max="420" step="10"></div>
+      </div>
+      <div class="settings-page hidden" data-page="input">
+        <div class="key-map"><span>Mover</span><b>Flechas</b><span>Patear</span><b>X / Espacio</b><span>Chat</span><b>Enter / Tab</b><span>Menú de sala</span><b>Esc</b><span>Pausa (admin)</span><b>P</b><span>Vistas</span><b>1 / 2 / 3 / 4 / 0</b></div>
+      </div>
+      <div class="settings-foot"><button id="saveSettings" class="hb-button primary">Aceptar</button></div>
+    </div>
+  </div>
+
+  <input id="stadiumFile" class="hidden" type="file" accept=".hbs,.json,application/json">
+</div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="engine.js"></script>
+<script src="stadiums.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
