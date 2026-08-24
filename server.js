@@ -133,7 +133,7 @@ async function closeRoom(room,message='El host cerró la sala.',excludeSocketId=
 }
 async function leaveCurrentRoom(socket,reason='leave'){
   const room=getRoom(socket);if(!room)return;const p=getActor(socket,room);
-  if(room.ownerSocketId===socket.id){await closeRoom(room,'El host cerró la sala.',reason==='leave'?socket.id:null);socket.data.roomId=null;socket.data.playerId=null;return;}
+  if(room.ownerSocketId===socket.id){const msg=reason==='disconnect'?'La conexión se interrumpió.':'El host cerró la sala.';await closeRoom(room,msg,reason==='leave'?socket.id:null);socket.data.roomId=null;socket.data.playerId=null;return;}
   socket.leave(roomChannel(room.id));socket.data.roomId=null;socket.data.playerId=null;removePlayer(room,p,reason);
 }
 function relayRtc(socket,event,data){
@@ -187,7 +187,7 @@ io.on('connection',socket=>{
   socket.on('room:setPassword',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.password=cleanText(data?.password,30);broadcastRoomState(room);ack({ok:true});});
   socket.on('room:clearBans',(_,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.bannedNames.clear();ack({ok:true});});
   socket.on('room:partido',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});const id=String(data?.id||'').toLowerCase();if(id==='normal')room.teamKits=clone(DEFAULT_TEAM_KITS);else if(PARTIDOS[id])room.teamKits={1:clone(PARTIDOS[id].red),2:clone(PARTIDOS[id].blue)};else return ack({ok:false,error:'Partido desconocido.'});broadcastRoomState(room);ack({ok:true,name:id==='normal'?'Normal':PARTIDOS[id].name});});
-  socket.on('disconnect',()=>{leaveCurrentRoom(socket,'leave').catch(()=>{});});
+  socket.on('disconnect',()=>{leaveCurrentRoom(socket,'disconnect').catch(()=>{});});
 });
 
 setInterval(()=>{for(const room of rooms.values())io.to(roomChannel(room.id)).emit('room:pings',room.players.filter(p=>!p.bot).map(p=>[p.id,p.ping|0]));},1200);
