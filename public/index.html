@@ -52,6 +52,8 @@
           <div class="actions-spacer"></div>
           <button id="replaysBtn" class="hb-button">▶ &nbsp;Repeticiones</button>
           <button id="optionsFromLobby" class="hb-button">⚙ &nbsp;Opciones</button>
+          <button id="miscBtn" class="hb-button"><span id="miscBtnFlag">🌐</span>&nbsp; MISC</button>
+          <button id="avatarCustomBtn" class="hb-button">🖼 &nbsp;Avatar personalizado</button>
           <button id="logoutBtn" class="hb-button">↻ &nbsp;Cambiar apodo</button>
         </aside>
       </div>
@@ -214,7 +216,40 @@
     </div>
   </div>
 
-  <input id="stadiumFile" class="hidden" type="file" accept=".hbs,.json,application/json">
+
+  <!-- Custom image avatar -->
+  <div id="avatarModal" class="modal-backdrop hidden">
+    <div class="settings-dialog mini-dialog">
+      <div class="settings-head"><h1>Avatar personalizado</h1><button id="closeAvatarModal" class="close-x">×</button></div>
+      <div class="avatar-custom-body">
+        <div id="avatarPreview" class="avatar-preview"><span>Sin imagen</span></div>
+        <p>La imagen se recorta y reduce automáticamente. Dentro del jugador ocupa solo el centro para que sigan viéndose los colores del equipo.</p>
+        <div class="avatar-custom-actions">
+          <button id="chooseAvatarImage" class="hb-button primary">Elegir imagen</button>
+          <button id="removeAvatarImage" class="hb-button">Quitar imagen</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HaxBall-style MISC / country flag -->
+  <div id="miscModal" class="modal-backdrop hidden">
+    <div class="settings-dialog mini-dialog">
+      <div class="settings-head"><h1>MISC</h1><button id="closeMiscModal" class="close-x">×</button></div>
+      <div class="misc-body">
+        <div class="label-input"><label>País:</label><select id="miscCountry"></select></div>
+        <div class="misc-current"><span id="miscCurrentFlag">🌐</span><span id="miscCurrentText">Automático</span></div>
+        <p>La primera vez se elige según la configuración regional/zona horaria del dispositivo. Podés cambiarlo cuando quieras.</p>
+        <div class="avatar-custom-actions">
+          <button id="miscAuto" class="hb-button">Detectar automáticamente</button>
+          <button id="miscSave" class="hb-button primary">Aceptar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+    <input id="stadiumFile" class="hidden" type="file" accept=".hbs,.json,application/json">
+  <input id="avatarImageFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp">
 </div>
 <script src="/socket.io/socket.io.js"></script>
 <script src="engine.js"></script>
