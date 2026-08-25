@@ -53,7 +53,7 @@
           <button id="replaysBtn" class="hb-button">▶ &nbsp;Repeticiones</button>
           <button id="optionsFromLobby" class="hb-button">⚙ &nbsp;Opciones</button>
           <button id="miscBtn" class="hb-button"><span id="miscBtnFlag">🌐</span>&nbsp; MISC</button>
-          <button id="avatarCustomBtn" class="hb-button">🖼 &nbsp;Avatar personalizado</button>
+          <button id="avatarCustomBtn" class="hb-button">🖼 &nbsp;Icono personalizado</button>
           <button id="logoutBtn" class="hb-button">↻ &nbsp;Cambiar apodo</button>
         </aside>
       </div>
@@ -195,7 +195,7 @@
       </div>
       <div class="settings-page" data-page="general">
         <div class="label-input"><label>Apodo:</label><input id="setNick" maxlength="25"></div>
-        <div class="label-input"><label>Avatar:</label><input id="setAvatar" maxlength="2"></div>
+        <div class="label-input"><label>Avatar:</label><input id="setAvatar" placeholder="Máx. 2 símbolos"></div>
         <div class="label-input"><label>Extrapolation:</label><div class="inline-number"><input id="setExtrap" type="number" min="0" max="1000" step="1"><span>ms</span></div></div>
         <label class="checkbox-row"><input id="setShowChat" type="checkbox"> Mostrar chat</label>
         <label class="checkbox-row"><input id="setShowNames" type="checkbox"> Mostrar nombres</label>
@@ -217,13 +217,13 @@
   </div>
 
 
-  <!-- Custom image avatar -->
+  <!-- Custom profile icon -->
   <div id="avatarModal" class="modal-backdrop hidden">
     <div class="settings-dialog mini-dialog">
-      <div class="settings-head"><h1>Avatar personalizado</h1><button id="closeAvatarModal" class="close-x">×</button></div>
+      <div class="settings-head"><h1>Icono personalizado</h1><button id="closeAvatarModal" class="close-x">×</button></div>
       <div class="avatar-custom-body">
         <div id="avatarPreview" class="avatar-preview"><span>Sin imagen</span></div>
-        <p>La imagen se recorta y reduce automáticamente. Dentro del jugador ocupa solo el centro para que sigan viéndose los colores del equipo.</p>
+        <p>La imagen se recorta y reduce automáticamente y se usa como icono de perfil en los menús/listas. Dentro de la bolita del partido se mantiene el avatar clásico: hasta 2 números, letras, emojis o símbolos.</p>
         <div class="avatar-custom-actions">
           <button id="chooseAvatarImage" class="hb-button primary">Elegir imagen</button>
           <button id="removeAvatarImage" class="hb-button">Quitar imagen</button>
