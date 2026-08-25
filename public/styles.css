@@ -392,3 +392,13 @@ input:focus,select:focus{border-color:#b6a79f;box-shadow:0 0 0 1px #b6a79f33}
 .player-row .avatar-chip.custom-image{width:18px!important;height:18px!important;display:inline-flex!important;align-items:center;justify-content:center;overflow:hidden;border-radius:50%;flex:0 0 18px}
 .player-row .avatar-chip.custom-image img{width:16px;height:16px;object-fit:cover;border-radius:50%;display:block}
 @media(max-width:600px){.misc-current{margin-left:0}.misc-body .label-input{display:grid;grid-template-columns:80px 1fr}.misc-body .label-input label{width:auto}.misc-body select{min-width:0;width:100%}}
+
+
+/* ===== Small fidelity finish: slightly larger ESC room menu ===== */
+@media (min-width:761px){
+  .room-menu-panel{width:min(710px,calc(100vw - 24px))!important;max-height:min(575px,calc(100vh - 120px))!important}
+  .room-menu-main{grid-template-columns:82px 1fr 1.15fr 1fr!important;gap:7px!important;padding:17px 14px 0!important}
+  .host-stack .hax-blue-button{width:72px!important}
+  .player-list{height:152px!important;min-height:152px!important}
+  .match-settings{padding:13px 0 9px!important}
+}
