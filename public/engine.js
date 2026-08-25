@@ -14,6 +14,7 @@ const F={BALL:1,RED:2,BLUE:4,REDKO:8,BLUEKO:16,WALL:32,ALL:63,KICK:64,SCORE:128,
 F.PLAYER_COLLISION=F.BALL|F.RED|F.BLUE|F.WALL;
 const STATE_KICKOFF=0,STATE_PLAYING=1,STATE_GOAL=2;
 const SQRT=(x,y)=>Math.sqrt(x*x+y*y);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 const add=(a,b)=>[a[0]+b[0],a[1]+b[1]];
 const sub=(a,b)=>[a[0]-b[0],a[1]-b[1]];
 const scale=(a,s)=>[a[0]*s,a[1]*s];
@@ -181,8 +182,8 @@ class World{
     this.stadium=JSON.parse(JSON.stringify(stadium||CLASSIC));
     this.players=players.filter(p=>p.team===1||p.team===2).map(p=>Object.assign({},p));
     this.discs=[];this.vertices=[];this.segments=[];this.planes=[];this.goals=[];this.playerIndexById=new Map();
-    this.redScore=0;this.blueScore=0;this.steps=0;this.state=STATE_KICKOFF;this.kickingTeam=F.RED;this.goalTimer=0;
-    this.kickRateMin=2;this.kickRateCost=0;this.kickRateCap=1;this.lastGoalConceding=null;this.lastKickBy=null;
+    this.redScore=0;this.blueScore=0;this.steps=0;this.state=STATE_KICKOFF;this.kickingTeam=F.RED;this.goalTimer=0;this.ballCurveSpin=0;this.ballCurveTicks=0;
+    this.kickRateMin=2;this.kickRateCost=0;this.kickRateCap=1;this.lastGoalConceding=null;this.lastKickBy=null;this.lastBallKickBy=null;
     this.kickOffReset=(this.stadium.kickOffReset||'partial').toLowerCase()==='full'?'full':'partial';
     this._build();
     // Keep the exact authored state of every non-player disc. HaxBall's `full`
@@ -244,7 +245,7 @@ class World{
   resetPositions(){
     // The game ball always returns to center on kickoff. With full reset all
     // custom/moving stadium discs return to the exact position/speed authored in .hbs.
-    this.discs[0].pos=[0,0];this.discs[0].vel=[0,0];
+    this.discs[0].pos=[0,0];this.discs[0].vel=[0,0];this.ballCurveSpin=0;this.ballCurveTicks=0;
     if(this.kickOffReset==='full'){
       for(let i=1;i<this.firstPlayer;i++){
         const st=this.initialNonPlayer?.[i];if(!st)continue;
@@ -265,8 +266,8 @@ class World{
     w.stadium=this.stadium;w.players=this.players.map(p=>Object.assign({},p));
     w.discs=this.discs.map(d=>Object.assign({},d,{pos:d.pos.slice(),vel:d.vel.slice(),gravity:d.gravity.slice()}));
     w.vertices=this.vertices;w.segments=this.segments;w.planes=this.planes;w.goals=this.goals;w.playerIndexById=new Map(this.playerIndexById);
-    w.redScore=this.redScore;w.blueScore=this.blueScore;w.steps=this.steps;w.state=this.state;w.kickingTeam=this.kickingTeam;w.goalTimer=this.goalTimer;
-    w.kickRateMin=this.kickRateMin;w.kickRateCost=this.kickRateCost;w.kickRateCap=this.kickRateCap;w.lastGoalConceding=null;w.lastKickBy=null;
+    w.redScore=this.redScore;w.blueScore=this.blueScore;w.steps=this.steps;w.state=this.state;w.kickingTeam=this.kickingTeam;w.goalTimer=this.goalTimer;w.ballCurveSpin=this.ballCurveSpin||0;w.ballCurveTicks=this.ballCurveTicks||0;
+    w.kickRateMin=this.kickRateMin;w.kickRateCost=this.kickRateCost;w.kickRateCap=this.kickRateCap;w.lastGoalConceding=null;w.lastKickBy=null;w.lastBallKickBy=null;
     w.firstPlayer=this.firstPlayer;w.nPlayers=this.nPlayers;w.spawnDistance=this.spawnDistance;w.redSpawn=this.redSpawn;w.blueSpawn=this.blueSpawn;w.kickOffReset=this.kickOffReset;
     w.initialNonPlayer=this.initialNonPlayer.map(x=>({pos:x.pos.slice(),vel:x.vel.slice()}));
     w.kickFlag=this.kickFlag.slice();w.kickHeldPrev=this.kickHeldPrev.slice();w.kickCooldown=this.kickCooldown.slice();w.kickBurst=this.kickBurst.slice();
@@ -319,9 +320,9 @@ class World{
     }
   }
   step(actionsById,predictionOnly=false){
-    this.lastGoalConceding=null;this.lastKickBy=null;
+    this.lastGoalConceding=null;this.lastKickBy=null;this.lastBallKickBy=null;
     for(let k=0;k<this.nPlayers;k++){
-      const pi=this.firstPlayer+k,d=this.discs[pi],pl=this.players[k],act=actionsById.get(pl.id)||[0,0,0];
+      const pi=this.firstPlayer+k,d=this.discs[pi],pl=this.players[k],act=actionsById.get(pl.id)||[0,0,0,0,0];
       const kickingInput=act[2]>=1,intraFrameRearm=act[2]===2;
       if((kickingInput&&!this.kickHeldPrev[k])||intraFrameRearm)this.kickFlag[k]=true;
       if(!kickingInput)this.kickFlag[k]=false;
@@ -335,9 +336,30 @@ class World{
         if(di===pi)continue;const target=this.discs[di];if((target.cgroup&F.KICK)===0)continue;
         const dx=target.pos[0]-px,dy=target.pos[1]-py,dist=SQRT(dx,dy);
         if(dist-target.radius-pr<4 && kickAllowed && dist>0){
-          const nx=dx/dist,ny=dy/dist;
-          target.vel[0]+=nx*ks*target.invMass;target.vel[1]+=ny*ks*target.invMass;
+          const nx=dx/dist,ny=dy/dist,curveCharge=clamp(Number(act[3])||0,0,1),powerCharge=clamp(Number(act[4])||0,0,1);
+          // /p starts as a normal kick during the 2.5 s wait. Once charged, its
+          // authoritative impulse grows progressively up to 1.85x at full charge.
+          // Custom kickable discs keep their authored/default kick behavior.
+          const powerMul=target.kind==='ball'?(1+.85*powerCharge):1;
+          target.vel[0]+=nx*ks*powerMul*target.invMass;target.vel[1]+=ny*ks*powerMul*target.invMass;
           d.vel[0]+=nx*-kb*pim;d.vel[1]+=ny*-kb*pim;
+          if(target.kind==='ball'){
+            if(curveCharge>0){
+              // /c also has a charge curve: first no effect, then progressively more
+              // angular spin and duration. Direction follows lateral movement; if the
+              // player is straight/still, use a deterministic team-side curl.
+              const mix=Number(act[0])||0,miy=Number(act[1])||0;
+              let side=nx*miy-ny*mix;
+              if(Math.abs(side)<.12)side=nx*d.vel[1]-ny*d.vel[0];
+              if(Math.abs(side)<.045)side=pl.team===1?1:-1;
+              this.ballCurveSpin=(side<0?-1:1)*(.0045+.0115*curveCharge);
+              this.ballCurveTicks=Math.round(30+60*curveCharge);
+            }else{
+              // A normal/unready touch cancels previous curl.
+              this.ballCurveSpin=0;this.ballCurveTicks=0;
+            }
+            if(!predictionOnly)this.lastBallKickBy=pl.id;
+          }
           didKick=true;if(!predictionOnly)this.lastKickBy=pl.id;
         }
       }
@@ -345,6 +367,17 @@ class World{
       const ix=act[0],iy=act[1],len=SQRT(ix,iy),nx=len>0?ix/len:0,ny=len>0?iy/len:0;
       const accel=this.kickFlag[k]?d.kickAccel:d.accel;
       d.vel[0]+=nx*accel;d.vel[1]+=ny*accel;
+    }
+    // Curved-shot spin is part of the authoritative simulation, not a render trick.
+    // Rotate ball velocity a little each 60 Hz tick and decay the spin smoothly.
+    if(this.ballCurveTicks>0&&Math.abs(this.ballCurveSpin)>1e-5){
+      const cb=this.discs[0],speed=SQRT(cb.vel[0],cb.vel[1]);
+      if(speed>.04){
+        const a=this.ballCurveSpin*clamp(speed/7,.38,1.18),ca=Math.cos(a),sa=Math.sin(a),vx=cb.vel[0],vy=cb.vel[1];
+        cb.vel[0]=vx*ca-vy*sa;cb.vel[1]=vx*sa+vy*ca;
+      }
+      this.ballCurveSpin*=.966;this.ballCurveTicks--;
+      if(this.ballCurveTicks<=0||Math.abs(this.ballCurveSpin)<.00035){this.ballCurveSpin=0;this.ballCurveTicks=0;}
     }
     // Any disc carrying the `score` collision flag can cross a goal line and score.
     // Standard maps only give it to the ball, but custom .hbs files may use it elsewhere.
@@ -377,7 +410,7 @@ class World{
     }else{
       this.goalTimer--;if(this.goalTimer<=0)this.resetPositions();
     }
-    return {goalConceding:this.lastGoalConceding,kickBy:this.lastKickBy};
+    return {goalConceding:this.lastGoalConceding,kickBy:this.lastKickBy,ballKickBy:this.lastBallKickBy};
   }
 }
 
