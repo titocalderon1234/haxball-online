@@ -22,8 +22,12 @@ let accumulator=0,lastFrame=performance.now(),lastRender=0,audioCtx=null,chatDra
 let prevPhysicsSnapshot=null,currPhysicsSnapshot=null,lastNetPacket=null,lastNetSnapshotAt=0,inputSeq=0,lastSentInput='',myPing=0;
 let peerLinks=new Map(),hostLink=null,peerInputs=new Map(),hostSnapshotDivider=0,hostMetaDivider=0,hostPendingWinner=0,hostFinishing=false;
 let connectionInterruptedHandled=false,hostInterruptTimer=null;
-let specialModes={curve:false,power:false},specialChargeState=new Map();
-const SPECIAL_READY_TICKS=150,SPECIAL_RAMP_TICKS=240; // 2.5 s de espera + 4 s hasta carga máxima (60 Hz)
+let specialModes={curve:false,power:false},specialChargeState=new Map(),specialControllerId=null,specialControllerGrace=0;
+// La carga es por CONTROL CONTINUO de la pelota, no por tiempo desde que se escribió /c o /p.
+// 60 Hz: 2.0 s = amarillo, 3.0 s = naranja, 3.5 s = rojo/máximo.
+const SPECIAL_YELLOW_TICKS=120,SPECIAL_ORANGE_TICKS=180,SPECIAL_RED_TICKS=210;
+const SPECIAL_CONTROL_EXTRA=4,SPECIAL_CONTROL_GRACE_EXTRA=2,SPECIAL_CONTROL_GRACE_TICKS=3;
+const SPECIAL_COLOR_YELLOW='FFF200',SPECIAL_COLOR_ORANGE='FF8A00',SPECIAL_COLOR_RED='FF2D2D';
 const RTC_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}],iceCandidatePoolSize:2};
 let pendingRoomFromUrl=new URLSearchParams(location.search).get('room')||null,lastJoinPassword='';
 
@@ -88,9 +92,31 @@ function normalizeLocalProfile(){
 function profilePayload(extra={}){return Object.assign({name:settings.nick,avatar:settings.avatar,avatarImage:settings.avatarImage||'',country:validCountry(settings.country)?settings.country:'XX'},extra);}
 const avatarImageCache=new Map();
 function getAvatarImage(src){if(!src)return null;let img=avatarImageCache.get(src);if(img)return img;img=new Image();img.decoding='async';img.onload=()=>{try{render();}catch{}};img.src=src;avatarImageCache.set(src,img);return img;}
-function specialStrength(ticks){ticks=Math.max(0,ticks|0);if(ticks<=SPECIAL_READY_TICKS)return 0;return clamp((ticks-SPECIAL_READY_TICKS)/SPECIAL_RAMP_TICKS,0,1);}
-function resetSpecialCharge(playerId=null){if(playerId==null)specialChargeState.clear();else{const st=specialChargeState.get(playerId);if(st){st.curveTicks=0;st.powerTicks=0;}}}
-function resetSpecialModes(){specialModes={curve:false,power:false};specialChargeState.clear();}
+function normalizeHex6(value,fallback='FFFFFF'){let h=String(value??'').replace(/^#/,'').trim();if(!/^[0-9a-f]{1,6}$/i.test(h))h=fallback;return h.padStart(6,'0').slice(-6).toUpperCase();}
+function lerpHexColor(a,b,t){a=normalizeHex6(a);b=normalizeHex6(b);t=clamp(Number(t)||0,0,1);const aa=parseInt(a,16),bb=parseInt(b,16),ar=(aa>>16)&255,ag=(aa>>8)&255,ab=aa&255,br=(bb>>16)&255,bg=(bb>>8)&255,bbv=bb&255;const r=Math.round(ar+(br-ar)*t),g=Math.round(ag+(bg-ag)*t),bl=Math.round(ab+(bbv-ab)*t);return ((r<<16)|(g<<8)|bl).toString(16).padStart(6,'0').toUpperCase();}
+function specialStrength(ticks){
+  ticks=Math.max(0,ticks|0);if(ticks<SPECIAL_YELLOW_TICKS)return 0;
+  // Al llegar a amarillo el tiro ya es perceptiblemente especial; después sube de
+  // forma continua. Rojo equivale a 100 %. El motor traduce 100 % a ~1.50x.
+  if(ticks<SPECIAL_ORANGE_TICKS)return .35+.35*((ticks-SPECIAL_YELLOW_TICKS)/(SPECIAL_ORANGE_TICKS-SPECIAL_YELLOW_TICKS));
+  if(ticks<SPECIAL_RED_TICKS)return .70+.30*((ticks-SPECIAL_ORANGE_TICKS)/(SPECIAL_RED_TICKS-SPECIAL_ORANGE_TICKS));
+  return 1;
+}
+function specialBallColor(ticks,base){
+  ticks=Math.max(0,ticks|0);base=normalizeHex6(base||'FFFFFF');
+  // Pequeña transición previa para que al cumplirse 2.0 s ya sea amarillo sin un salto.
+  const yellowBlendStart=SPECIAL_YELLOW_TICKS-12; // 0.20 s
+  if(ticks<yellowBlendStart)return base;
+  if(ticks<SPECIAL_YELLOW_TICKS)return lerpHexColor(base,SPECIAL_COLOR_YELLOW,(ticks-yellowBlendStart)/(SPECIAL_YELLOW_TICKS-yellowBlendStart));
+  if(ticks<SPECIAL_ORANGE_TICKS)return lerpHexColor(SPECIAL_COLOR_YELLOW,SPECIAL_COLOR_ORANGE,(ticks-SPECIAL_YELLOW_TICKS)/(SPECIAL_ORANGE_TICKS-SPECIAL_YELLOW_TICKS));
+  if(ticks<SPECIAL_RED_TICKS)return lerpHexColor(SPECIAL_COLOR_ORANGE,SPECIAL_COLOR_RED,(ticks-SPECIAL_ORANGE_TICKS)/(SPECIAL_RED_TICKS-SPECIAL_ORANGE_TICKS));
+  return SPECIAL_COLOR_RED;
+}
+function resetSpecialCharge(playerId=null){
+  if(playerId==null){specialChargeState.clear();specialControllerId=null;specialControllerGrace=0;}
+  else{const st=specialChargeState.get(playerId);if(st)st.controlTicks=0;if(specialControllerId===playerId){specialControllerId=null;specialControllerGrace=0;}}
+}
+function resetSpecialModes(){specialModes={curve:false,power:false};specialChargeState.clear();specialControllerId=null;specialControllerGrace=0;}
 normalizeLocalProfile();
 
 function teamName(t){return t===1?'Rojo':t===2?'Azul':'Espectadores';}
@@ -197,7 +223,9 @@ function reportPageVisibility(){
 }
 document.addEventListener('visibilitychange',reportPageVisibility);
 function makeGamePacket(){
-  if(!world)return null;const snap=world.snapshot();return {t:'s',tick:world.steps,running:gameRunning,paused,overtime,elapsedTicks,redScore:world.redScore,blueScore:world.blueScore,state:world.state,kickingTeam:world.kickingTeam,goalTimer:world.goalTimer,goalScoringTeam,ending:endingGame,finalWinner,ballCurveSpin:world.ballCurveSpin||0,ballCurveTicks:world.ballCurveTicks||0,discs:snap.map(d=>[d.x,d.y,d.vx,d.vy,d.r]),kickFlags:world.kickFlag.slice()};
+  if(!world)return null;const snap=world.snapshot();return {t:'s',tick:world.steps,running:gameRunning,paused,overtime,elapsedTicks,redScore:world.redScore,blueScore:world.blueScore,state:world.state,kickingTeam:world.kickingTeam,goalTimer:world.goalTimer,goalScoringTeam,ending:endingGame,finalWinner,
+    ballCurveSpin:world.ballCurveSpin||0,ballCurveTicks:world.ballCurveTicks||0,ballCurveTotalTicks:world.ballCurveTotalTicks||0,ballCurveIntensity:world.ballCurveIntensity||0,ballCurveDir:Array.isArray(world.ballCurveDir)?world.ballCurveDir.slice(0,2):[0,0],ballColor:world.discs[0]?.color||world.ballBaseColor||'FFFFFF',
+    discs:snap.map(d=>[d.x,d.y,d.vx,d.vy,d.r]),kickFlags:world.kickFlag.slice()};
 }
 function sendHostSnapshot(force=false,onlyLink=null){if(!isHost()||!world)return;const pkt=makeGamePacket();if(!pkt)return;lastNetPacket=pkt;prevPhysicsSnapshot=currPhysicsSnapshot||world.snapshot();currPhysicsSnapshot=world.snapshot();lastNetSnapshotAt=performance.now();const links=onlyLink?[onlyLink]:[...peerLinks.values()];for(const l of links)safeDcSend(l.dc,pkt);updateHud();}
 function botAction(p){
@@ -205,21 +233,43 @@ function botAction(p){
   if(world.state===E.STATE_KICKOFF&&world.kickingTeam!==d.team){tx=p.team===1?-world.spawnDistance:world.spawnDistance;ty=0;}else{tx=b.pos[0]-attack*24;ty=b.pos[1];}
   const dx=tx-d.pos[0],dy=ty-d.pos[1];return [Math.abs(dx)<2?0:Math.sign(dx),Math.abs(dy)<2?0:Math.sign(dy),dist<34?1:0];
 }
+function currentBallController(){
+  if(!world||!world.discs?.[0])return null;const b=world.discs[0];let best=null,bestDist=Infinity;
+  for(const p of players){
+    if(!(p.team===1||p.team===2))continue;const wi=world.playerIndexById.get(p.id);if(wi==null)continue;const d=world.discs[wi];
+    const dx=b.pos[0]-d.pos[0],dy=b.pos[1]-d.pos[1],dist=Math.sqrt(dx*dx+dy*dy),limit=(b.radius||0)+(d.radius||0)+SPECIAL_CONTROL_EXTRA;
+    if(dist<=limit&&dist<bestDist){best=p.id;bestDist=dist;}
+  }
+  if(best!=null){specialControllerId=best;specialControllerGrace=SPECIAL_CONTROL_GRACE_TICKS;return best;}
+  // Tres ticks de tolerancia solamente si el mismo jugador sigue casi dentro del
+  // alcance de patada. Evita que un rebote microscópico del contacto resetee 3 s de carga.
+  if(specialControllerId!=null&&specialControllerGrace>0){
+    const wi=world.playerIndexById.get(specialControllerId);if(wi!=null){const d=world.discs[wi],dx=b.pos[0]-d.pos[0],dy=b.pos[1]-d.pos[1],dist=Math.sqrt(dx*dx+dy*dy),limit=(b.radius||0)+(d.radius||0)+SPECIAL_CONTROL_EXTRA+SPECIAL_CONTROL_GRACE_EXTRA;if(dist<=limit){specialControllerGrace--;return specialControllerId;}}
+  }
+  specialControllerId=null;specialControllerGrace=0;return null;
+}
 function hostActions(localAct){
-  const m=new Map(),activeIds=new Set();
+  const m=new Map(),activeIds=new Set(),rawById=new Map();
   for(const p of players){
     if(!(p.team===1||p.team===2))continue;activeIds.add(p.id);
-    const raw=p.bot?botAction(p):(p.id===myPlayerId?localAct:(peerInputs.get(p.id)?.act||[0,0,0,0,0]));
-    let st=specialChargeState.get(p.id);if(!st){st={curveTicks:0,powerTicks:0};specialChargeState.set(p.id,st);}
-    if(raw[3])st.curveTicks=Math.min(SPECIAL_READY_TICKS+SPECIAL_RAMP_TICKS,st.curveTicks+1);else st.curveTicks=0;
-    if(raw[4])st.powerTicks=Math.min(SPECIAL_READY_TICKS+SPECIAL_RAMP_TICKS,st.powerTicks+1);else st.powerTicks=0;
-    m.set(p.id,[raw[0]||0,raw[1]||0,raw[2]||0,specialStrength(st.curveTicks),specialStrength(st.powerTicks)]);
+    const raw=p.bot?botAction(p):(p.id===myPlayerId?localAct:(peerInputs.get(p.id)?.act||[0,0,0,0,0]));rawById.set(p.id,raw);
+  }
+  const controllerId=currentBallController();let controllerTicks=0,controllerMode=false;
+  for(const p of players){
+    if(!activeIds.has(p.id))continue;const raw=rawById.get(p.id)||[0,0,0,0,0],curveOn=!!raw[3],powerOn=!!raw[4];let st=specialChargeState.get(p.id);if(!st){st={controlTicks:0};specialChargeState.set(p.id,st);}
+    if(p.id===controllerId&&(curveOn||powerOn)){st.controlTicks=Math.min(SPECIAL_RED_TICKS,st.controlTicks+1);controllerTicks=st.controlTicks;controllerMode=true;}
+    else st.controlTicks=0;
+    const charge=specialStrength(st.controlTicks);
+    // /c = mismo golpe fuerte que /p + comba. /p = solo potencia.
+    m.set(p.id,[raw[0]||0,raw[1]||0,raw[2]||0,curveOn?charge:0,powerOn?charge:0]);
   }
   for(const id of [...specialChargeState.keys()])if(!activeIds.has(id))specialChargeState.delete(id);
+  if(world?.discs?.[0])world.discs[0].color=controllerMode?specialBallColor(controllerTicks,world.ballBaseColor):normalizeHex6(world.ballBaseColor||world.discs[0].color||'FFFFFF');
   return m;
 }
+
 function rebuildHostWorld(oldWorld){
-  const nw=new E.World(selectedStadium,players);if(!oldWorld)return nw;nw.redScore=oldWorld.redScore;nw.blueScore=oldWorld.blueScore;nw.state=oldWorld.state;nw.kickingTeam=oldWorld.kickingTeam;nw.goalTimer=oldWorld.goalTimer;nw.steps=oldWorld.steps;nw.ballCurveSpin=oldWorld.ballCurveSpin||0;nw.ballCurveTicks=oldWorld.ballCurveTicks||0;
+  const nw=new E.World(selectedStadium,players);if(!oldWorld)return nw;nw.redScore=oldWorld.redScore;nw.blueScore=oldWorld.blueScore;nw.state=oldWorld.state;nw.kickingTeam=oldWorld.kickingTeam;nw.goalTimer=oldWorld.goalTimer;nw.steps=oldWorld.steps;nw.ballCurveSpin=oldWorld.ballCurveSpin||0;nw.ballCurveTicks=oldWorld.ballCurveTicks||0;nw.ballCurveTotalTicks=oldWorld.ballCurveTotalTicks||0;nw.ballCurveIntensity=oldWorld.ballCurveIntensity||0;nw.ballCurveDir=Array.isArray(oldWorld.ballCurveDir)?oldWorld.ballCurveDir.slice():[0,0];
   const non=Math.min(nw.firstPlayer,oldWorld.firstPlayer);for(let i=0;i<non;i++){nw.discs[i].pos=oldWorld.discs[i].pos.slice();nw.discs[i].vel=oldWorld.discs[i].vel.slice();}
   const oldPlayersById=new Map((oldWorld.players||[]).map(p=>[p.id,p]));
   for(const p of players){
@@ -240,7 +290,7 @@ function rebuildHostWorld(oldWorld){
   return nw;
 }
 function hostStep(localAct){
-  if(!isHost()||!gameRunning||paused||endingGame||!world)return;lastActions=hostActions(localAct);const r=world.step(lastActions);elapsedTicks++;if(r.ballKickBy!=null)resetSpecialCharge(r.ballKickBy);
+  if(!isHost()||!gameRunning||paused||endingGame||!world)return;lastActions=hostActions(localAct);const r=world.step(lastActions);elapsedTicks++;if(r.ballKickBy!=null){resetSpecialCharge(r.ballKickBy);if(world.discs?.[0])world.discs[0].color=normalizeHex6(world.ballBaseColor||'FFFFFF');}
   if(r.goalConceding){const scoring=r.goalConceding===F.RED?2:1;goalScoringTeam=scoring;socket.emit('room:hostMeta',{elapsedTicks,overtime,redScore:world.redScore,blueScore:world.blueScore});if((room.scoreLimit||0)>0&&(world.redScore>=room.scoreLimit||world.blueScore>=room.scoreLimit))hostPendingWinner=world.redScore>world.blueScore?1:2;if(overtime)hostPendingWinner=scoring;}
   if(world.state!==E.STATE_GOAL&&!hostPendingWinner)goalScoringTeam=0;
   if(hostPendingWinner&&world.state===E.STATE_KICKOFF&&!hostFinishing){hostFinishing=true;gameRunning=false;endingGame=true;finalWinner=hostPendingWinner;sendHostSnapshot(true);socket.emit('room:hostFinish',{team:hostPendingWinner});return;}
@@ -428,7 +478,7 @@ function applyPacketToWorld(pkt,refresh=true){
   if(!world)world=new E.World(selectedStadium,players);if(!Array.isArray(pkt.discs)||pkt.discs.length!==world.discs.length){world=new E.World(selectedStadium,players);if(pkt.discs?.length!==world.discs.length){prevPhysicsSnapshot=world.snapshot();currPhysicsSnapshot=world.snapshot();lastNetSnapshotAt=performance.now();return;}}
   prevPhysicsSnapshot=currPhysicsSnapshot||world.snapshot();
   for(let i=0;i<pkt.discs.length;i++){const a=pkt.discs[i],d=world.discs[i];d.pos[0]=+a[0];d.pos[1]=+a[1];d.vel[0]=+a[2];d.vel[1]=+a[3];if(a[4]!=null)d.radius=+a[4];}
-  world.redScore=pkt.redScore|0;world.blueScore=pkt.blueScore|0;world.state=pkt.state;world.kickingTeam=pkt.kickingTeam;world.goalTimer=pkt.goalTimer|0;world.steps=pkt.tick|0;world.ballCurveSpin=Number(pkt.ballCurveSpin)||0;world.ballCurveTicks=Math.max(0,Number(pkt.ballCurveTicks)||0)|0;if(Array.isArray(pkt.kickFlags))world.kickFlag=pkt.kickFlags.slice();
+  world.redScore=pkt.redScore|0;world.blueScore=pkt.blueScore|0;world.state=pkt.state;world.kickingTeam=pkt.kickingTeam;world.goalTimer=pkt.goalTimer|0;world.steps=pkt.tick|0;world.ballCurveSpin=Number(pkt.ballCurveSpin)||0;world.ballCurveTicks=Math.max(0,Number(pkt.ballCurveTicks)||0)|0;world.ballCurveTotalTicks=Math.max(0,Number(pkt.ballCurveTotalTicks)||0)|0;world.ballCurveIntensity=clamp(Number(pkt.ballCurveIntensity)||0,0,1);world.ballCurveDir=Array.isArray(pkt.ballCurveDir)?[Number(pkt.ballCurveDir[0])||0,Number(pkt.ballCurveDir[1])||0]:[0,0];if(pkt.ballColor!=null&&world.discs?.[0])world.discs[0].color=normalizeHex6(pkt.ballColor,world.ballBaseColor||'FFFFFF');if(Array.isArray(pkt.kickFlags))world.kickFlag=pkt.kickFlags.slice();
   currPhysicsSnapshot=world.snapshot();for(let k=0;k<world.nPlayers;k++)currPhysicsSnapshot[world.firstPlayer+k].kick=!!world.kickFlag[k];lastNetSnapshotAt=performance.now();
   if(replayRecording&&pkt.tick%2===0)replayFrames.push({t:pkt.tick,score:[world.redScore,world.blueScore],state:world.state,discs:currPhysicsSnapshot.map(d=>[d.x,d.y,d.vx,d.vy])});
   if(refresh){syncGameViewState();updateHud();}
@@ -442,14 +492,14 @@ function focusChat(){$('#chatPanel').classList.remove('chat-hidden');$('#chatPan
 function blurChat(){$('#chatInput').blur();$('#chatPanel').classList.remove('focused');if(!settings.showChat)$('#chatPanel').classList.add('chat-hidden');}
 function submitChat(){const inp=$('#chatInput'),txt=inp.value.trim();inp.value='';if(txt){if(txt.startsWith('/')||txt.startsWith('!'))runCommand(txt);else socket.emit('chat:send',{text:txt});}blurChat();}
 $('#chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();e.stopPropagation();submitChat();}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();$('#chatInput').value='';blurChat();}else if(e.key==='Tab'){e.preventDefault();e.stopPropagation();blurChat();}});
-function showHelp(){addSystem('Comandos disponibles:');addSystem('/avatar <texto> — cambia el avatar (máximo 2 caracteres).');addSystem('/clear_avatar — vuelve a mostrar el número del jugador.');addSystem('/extrapolation <ms> — predicción visual del cliente (0 a 1000 ms).');addSystem('/set_password <clave> — establece contraseña de sala (admin).');addSystem('/clear_password — quita la contraseña de sala (admin).');addSystem('/clear_bans — limpia baneos (admin).');addSystem('/partido — muestra camisetas; /partido <nombre> las aplica.');addSystem('/c — activa/desactiva Comba (2.5 s de carga mínima).');addSystem('/p — activa/desactiva Powershot (2.5 s de carga mínima).');}
+function showHelp(){addSystem('Comandos disponibles:');addSystem('/avatar <texto> — cambia el avatar (máximo 2 caracteres).');addSystem('/clear_avatar — vuelve a mostrar el número del jugador.');addSystem('/extrapolation <ms> — predicción visual del cliente (0 a 1000 ms).');addSystem('/set_password <clave> — establece contraseña de sala (admin).');addSystem('/clear_password — quita la contraseña de sala (admin).');addSystem('/clear_bans — limpia baneos (admin).');addSystem('/partido — muestra camisetas; /partido <nombre> las aplica.');addSystem('/c — Comba: controlá la pelota 2 s (amarillo), 3 s (naranja), 3.5 s (rojo/máximo).');addSystem('/p — Powershot: misma carga por control; aumenta solo la potencia.');}
 function showPartidos(){addSystem('Partidos disponibles:');for(const [id,p] of Object.entries(PARTIDOS))addSystem(`${id} — ${p.name}`);addSystem('normal — restaura Rojo/Azul.');addSystem('Usá /partido <nombre>.');}
 function runCommand(raw){
   const prefix=raw[0],body=raw.slice(1).trim(),[cmdRaw,...rest]=body.split(/\s+/),arg=rest.join(' '),me=human(),cmd=(cmdRaw||'').toLowerCase();
   if(prefix==='!'){if(cmd==='help'){showHelp();return;}addSystem(`Comando desconocido: !${cmd}. Escribí !help.`);return;}
   switch(cmd){
-    case 'c':specialModes.curve=!specialModes.curve;addSystem(`Modo COMBA ${specialModes.curve?'activado':'desactivado'}.${specialModes.curve?' Esperá 2.5 s para que empiece a cargarse; después aumenta hasta el máximo.':''}`);if(!specialModes.curve){const st=specialChargeState.get(myPlayerId);if(st)st.curveTicks=0;}break;
-    case 'p':specialModes.power=!specialModes.power;addSystem(`Modo POWERSHOT ${specialModes.power?'activado':'desactivado'}.${specialModes.power?' Esperá 2.5 s para que empiece a cargarse; después aumenta hasta el máximo.':''}`);if(!specialModes.power){const st=specialChargeState.get(myPlayerId);if(st)st.powerTicks=0;}break;
+    case 'c':{const next=!specialModes.curve;specialModes.curve=next;specialModes.power=false;resetSpecialCharge(myPlayerId);addSystem(`Modo COMBA ${next?'activado':'desactivado'}.${next?' La carga empieza solamente mientras controlás la pelota: 2 s amarillo, 3 s naranja, 3.5 s rojo.':''}`);break;}
+    case 'p':{const next=!specialModes.power;specialModes.power=next;specialModes.curve=false;resetSpecialCharge(myPlayerId);addSystem(`Modo POWERSHOT ${next?'activado':'desactivado'}.${next?' La carga empieza solamente mientras controlás la pelota: 2 s amarillo, 3 s naranja, 3.5 s rojo.':''}`);break;}
     case 'avatar':settings.avatar=arg.slice(0,2);saveSettings();socket.emit('profile:update',profilePayload());syncSettingsFields();break;
     case 'clear_avatar':settings.avatar='';saveSettings();socket.emit('profile:update',profilePayload({avatar:''}));syncSettingsFields();break;
     case 'extrapolation':settings.extrapolation=clamp(parseInt(rest[0],10)||0,0,1000);settings.extrapolationTouched=true;saveSettings();addSystem(`Extrapolation: ${settings.extrapolation} ms.`);syncSettingsFields();break;
