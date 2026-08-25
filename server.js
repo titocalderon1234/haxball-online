@@ -40,6 +40,8 @@ const PARTIDOS={
 function cleanText(v,max=40){return String(v??'').replace(/[\u0000-\u001f\u007f]/g,'').trim().slice(0,max);}
 function cleanNick(v){return cleanText(v,25)||'Jugador';}
 function cleanAvatar(v){return String(v??'').replace(/[\r\n\t]/g,'').slice(0,2);}
+function cleanCountry(v){const c=String(v??'').trim().toUpperCase();return /^[A-Z]{2}$/.test(c)?c:'XX';}
+function cleanAvatarImage(v){const s=String(v??'');if(!s)return '';if(s.length>30000)return '';return /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(s)?s:'';}
 function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
 function clone(v){return JSON.parse(JSON.stringify(v));}
 function roomChannel(id){return `room:${id}`;}
@@ -51,14 +53,14 @@ function stadiumFor(room){
   if(BUILTINS[room.stadiumKey])return BUILTINS[room.stadiumKey];
   return E.CLASSIC;
 }
-function publicRooms(){return [...rooms.values()].filter(r=>!r.unlisted).map(r=>({id:r.id,name:r.name,maxPlayers:r.maxPlayers,players:r.players.length,password:!!r.password,unlisted:false,distance:'P2P',running:r.gameRunning}));}
+function publicRooms(){return [...rooms.values()].filter(r=>!r.unlisted).map(r=>{const owner=r.players.find(p=>p.id===r.ownerPlayerId);return {id:r.id,name:r.name,maxPlayers:r.maxPlayers,players:r.players.length,password:!!r.password,unlisted:false,distance:'P2P',running:r.gameRunning,country:owner?.country||'XX'};});}
 function broadcastRooms(){io.emit('rooms:list',publicRooms());}
-function serializePlayer(p){return {id:p.id,peerId:p.socketId||null,name:p.name,avatar:p.avatar,team:p.team,admin:!!p.admin,bot:!!p.bot,ping:p.ping|0};}
+function serializePlayer(p){return {id:p.id,peerId:p.socketId||null,name:p.name,avatar:p.avatar,avatarImage:p.avatarImage||'',country:p.country||'XX',team:p.team,admin:!!p.admin,bot:!!p.bot,ping:p.ping|0};}
 function serializeRoom(room){return {
   id:room.id,name:room.name,maxPlayers:room.maxPlayers,unlisted:room.unlisted,hasPassword:!!room.password,
   ownerPlayerId:room.ownerPlayerId,hostPeerId:room.hostSocketId||room.ownerSocketId,players:room.players.map(serializePlayer),teamsLocked:room.teamsLocked,
   stadiumKey:room.stadiumKey,stadium:clone(stadiumFor(room)),timeLimit:room.timeLimit,scoreLimit:room.scoreLimit,teamKits:clone(room.teamKits),
-  game:{running:room.gameRunning,paused:room.paused,overtime:room.overtime,elapsedTicks:room.elapsedTicks,ending:room.endingGame,finalWinner:room.finalWinner}
+  game:{running:room.gameRunning,paused:room.paused,overtime:room.overtime,elapsedTicks:room.elapsedTicks,redScore:room.redScore|0,blueScore:room.blueScore|0,ending:room.endingGame,finalWinner:room.finalWinner}
 };}
 function broadcastRoomState(room){io.to(roomChannel(room.id)).emit('room:state',serializeRoom(room));broadcastRooms();}
 function emitSystem(room,text){io.to(roomChannel(room.id)).emit('chat:message',{type:'system',text:String(text),ts:Date.now()});}
@@ -68,8 +70,8 @@ function requireAdmin(socket,room){const p=getActor(socket,room);return p&&p.adm
 function playerSocket(room,p){return p?.socketId?io.sockets.sockets.get(p.socketId):null;}
 function isSocketInRoom(target,room){return !!target&&target.data.roomId===room.id;}
 
-function createPlayer(room,socket,nick,avatar,admin=false,bot=false){
-  const p={id:room.nextPlayerId++,socketId:bot?null:socket.id,name:cleanNick(nick),avatar:cleanAvatar(avatar),team:0,admin:!!admin,bot:!!bot,ping:0,visible:true};
+function createPlayer(room,socket,nick,avatar,admin=false,bot=false,country='XX',avatarImage=''){
+  const p={id:room.nextPlayerId++,socketId:bot?null:socket.id,name:cleanNick(nick),avatar:cleanAvatar(avatar),avatarImage:cleanAvatarImage(avatarImage),country:cleanCountry(country),team:0,admin:!!admin,bot:!!bot,ping:0,visible:true};
   room.players.push(p);return p;
 }
 function newRoom(socket,data){
@@ -78,9 +80,9 @@ function newRoom(socket,data){
     id,name:cleanText(data?.name,40)||'Sala',maxPlayers:clamp(Number(data?.maxPlayers)||8,2,22),password:cleanText(data?.password,30),unlisted:!!data?.unlisted,
     ownerSocketId:socket.id,hostSocketId:socket.id,ownerPlayerId:null,nextPlayerId:1,players:[],bannedNames:new Set(),teamsLocked:false,
     stadiumKey:'classic',customStadium:null,timeLimit:3,scoreLimit:3,teamKits:clone(DEFAULT_TEAM_KITS),
-    gameRunning:false,paused:false,overtime:false,elapsedTicks:0,endingGame:false,finalWinner:0,endTimer:null
+    gameRunning:false,paused:false,overtime:false,elapsedTicks:0,redScore:0,blueScore:0,endingGame:false,finalWinner:0,endTimer:null
   };
-  const owner=createPlayer(room,socket,data?.nick,data?.avatar,true,false);room.ownerPlayerId=owner.id;rooms.set(id,room);
+  const owner=createPlayer(room,socket,data?.nick,data?.avatar,true,false,data?.country,data?.avatarImage);room.ownerPlayerId=owner.id;rooms.set(id,room);
   socket.join(roomChannel(id));socket.data.roomId=id;socket.data.playerId=owner.id;return room;
 }
 function movePlayer(room,p,team){
@@ -96,12 +98,12 @@ function autoTeams(room,randomMode){
 }
 function startGame(room,by){
   if(room.endTimer){clearTimeout(room.endTimer);room.endTimer=null;}
-  room.gameRunning=true;room.paused=false;room.overtime=false;room.elapsedTicks=0;room.endingGame=false;room.finalWinner=0;
+  room.gameRunning=true;room.paused=false;room.overtime=false;room.elapsedTicks=0;room.redScore=0;room.blueScore=0;room.endingGame=false;room.finalWinner=0;
   emitSystem(room,`Partida iniciada por ${by.name}.`);broadcastRoomState(room);
 }
 function stopGame(room,by,message=true){
   if(room.endTimer){clearTimeout(room.endTimer);room.endTimer=null;}
-  room.gameRunning=false;room.paused=false;room.overtime=false;room.elapsedTicks=0;room.endingGame=false;room.finalWinner=0;
+  room.gameRunning=false;room.paused=false;room.overtime=false;room.elapsedTicks=0;room.redScore=0;room.blueScore=0;room.endingGame=false;room.finalWinner=0;
   if(message&&by)emitSystem(room,`Partida detenida por ${by.name}.`);broadcastRoomState(room);
 }
 function finishGame(room,team){
@@ -133,7 +135,7 @@ async function closeRoom(room,message='El host cerró la sala.',excludeSocketId=
 }
 async function leaveCurrentRoom(socket,reason='leave'){
   const room=getRoom(socket);if(!room)return;const p=getActor(socket,room);
-  if(room.ownerSocketId===socket.id){const msg=reason==='disconnect'?'La conexión se interrumpió.':'El host cerró la sala.';await closeRoom(room,msg,reason==='leave'?socket.id:null);socket.data.roomId=null;socket.data.playerId=null;return;}
+  if(room.ownerSocketId===socket.id){await closeRoom(room,'El host cerró la sala.',reason==='leave'?socket.id:null);socket.data.roomId=null;socket.data.playerId=null;return;}
   socket.leave(roomChannel(room.id));socket.data.roomId=null;socket.data.playerId=null;removePlayer(room,p,reason);
 }
 function relayRtc(socket,event,data){
@@ -152,7 +154,7 @@ io.on('connection',socket=>{
   socket.on('room:join',async(data,ack=()=>{})=>{
     const room=rooms.get(String(data?.roomId||''));if(!room)return ack({ok:false,error:'La sala ya no existe.'});const nick=cleanNick(data?.nick);
     if(room.bannedNames.has(nick.toLowerCase()))return ack({ok:false,error:'Estás baneado de esta sala.'});if(room.players.length>=room.maxPlayers)return ack({ok:false,error:'La sala está llena.'});if(room.password&&String(data?.password||'')!==room.password)return ack({ok:false,error:'Contraseña incorrecta.'});
-    if(getRoom(socket))await leaveCurrentRoom(socket);socket.join(roomChannel(room.id));const p=createPlayer(room,socket,nick,data?.avatar,false,false);socket.data.roomId=room.id;socket.data.playerId=p.id;
+    if(getRoom(socket))await leaveCurrentRoom(socket);socket.join(roomChannel(room.id));const p=createPlayer(room,socket,nick,data?.avatar,false,false,data?.country,data?.avatarImage);socket.data.roomId=room.id;socket.data.playerId=p.id;
     ack({ok:true,myPlayerId:p.id,state:serializeRoom(room)});emitSystem(room,`${p.name} entró a la sala.`);broadcastRoomState(room);
   });
   socket.on('room:leave',async(_,ack=()=>{})=>{await leaveCurrentRoom(socket);ack({ok:true});});
@@ -174,7 +176,7 @@ io.on('connection',socket=>{
   });
   socket.on('net:ping',(t,ack)=>{if(typeof ack==='function')ack(t);});
   socket.on('chat:send',data=>{const room=getRoom(socket),p=getActor(socket,room);if(!room||!p)return;const text=cleanText(data?.text,140);if(!text)return;io.to(roomChannel(room.id)).emit('chat:message',{type:p.team===1?'red':p.team===2?'blue':'system',text,name:p.name,playerId:p.id,ts:Date.now()});});
-  socket.on('profile:update',(data,ack=()=>{})=>{const room=getRoom(socket),p=getActor(socket,room);if(!room||!p)return ack({ok:false});p.name=cleanNick(data?.name??p.name);p.avatar=cleanAvatar(data?.avatar??p.avatar);broadcastRoomState(room);ack({ok:true});});
+  socket.on('profile:update',(data,ack=()=>{})=>{const room=getRoom(socket),p=getActor(socket,room);if(!room||!p)return ack({ok:false});p.name=cleanNick(data?.name??p.name);p.avatar=cleanAvatar(data?.avatar??p.avatar);if(data&&Object.prototype.hasOwnProperty.call(data,'avatarImage'))p.avatarImage=cleanAvatarImage(data.avatarImage);if(data&&Object.prototype.hasOwnProperty.call(data,'country'))p.country=cleanCountry(data.country);broadcastRoomState(room);if(p.id===room.ownerPlayerId)broadcastRooms();ack({ok:true});});
   socket.on('room:setTeam',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});const p=room.players.find(x=>x.id===Number(data?.playerId));if(!p)return ack({ok:false});movePlayer(room,p,Number(data?.team));broadcastRoomState(room);ack({ok:true});});
   socket.on('room:teamAction',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});const action=String(data?.action||'');if(action==='auto')autoTeams(room,false);else if(action==='rand')autoTeams(room,true);else if(action==='reset'){for(const p of [...room.players])if(p.team!==0)movePlayer(room,p,0);}else if(action==='resetRed'){for(const p of [...room.players])if(p.team===1)movePlayer(room,p,0);}else if(action==='resetBlue'){for(const p of [...room.players])if(p.team===2)movePlayer(room,p,0);}else if(action==='lock')room.teamsLocked=!room.teamsLocked;else return ack({ok:false});broadcastRoomState(room);ack({ok:true});});
   socket.on('room:addBot',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});if(room.players.length>=room.maxPlayers)return ack({ok:false,error:'Sala llena.'});const n=room.players.filter(p=>p.bot).length+1,p=createPlayer(room,socket,`CPU ${n}`,'',false,true);p.team=Number(data?.team)===1?1:2;broadcastRoomState(room);ack({ok:true});});
@@ -182,12 +184,12 @@ io.on('connection',socket=>{
   socket.on('room:setLimits',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.timeLimit=clamp(Number(data?.timeLimit)||0,0,10);room.scoreLimit=clamp(Number(data?.scoreLimit)||0,0,10);broadcastRoomState(room);ack({ok:true});});
   socket.on('room:setStadium',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});if(room.gameRunning)return ack({ok:false,error:'Detené la partida primero.'});const key=String(data?.key||'classic');if(key==='custom'){try{const raw=data?.stadium;if(JSON.stringify(raw).length>400000)throw new Error('Mapa demasiado grande');room.customStadium=E.validateStadium(clone(raw));room.stadiumKey='custom';}catch(err){return ack({ok:false,error:err.message||'Mapa inválido.'});}}else if(['classic','small','big',...Object.keys(BUILTINS)].includes(key)){room.stadiumKey=key;room.customStadium=null;}else return ack({ok:false,error:'Estadio inválido.'});broadcastRoomState(room);ack({ok:true});});
   socket.on('room:gameAction',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});const action=String(data?.action||'');if(action==='start'){if(room.gameRunning)return ack({ok:false});startGame(room,actor);ack({ok:true});}else if(action==='stop'){stopGame(room,actor,true);ack({ok:true});}else if(action==='pause'){if(!room.gameRunning)return ack({ok:false});room.paused=!room.paused;emitSystem(room,room.paused?`Partida pausada por ${actor.name}.`:`Partida reanudada por ${actor.name}.`);broadcastRoomState(room);ack({ok:true});}else ack({ok:false});});
-  socket.on('room:hostMeta',(data,ack=()=>{})=>{const room=getRoom(socket);if(!room||socket.id!==(room.hostSocketId||room.ownerSocketId))return ack({ok:false});room.elapsedTicks=Math.max(0,Number(data?.elapsedTicks)||0)|0;room.overtime=!!data?.overtime;ack({ok:true});});
+  socket.on('room:hostMeta',(data,ack=()=>{})=>{const room=getRoom(socket);if(!room||socket.id!==(room.hostSocketId||room.ownerSocketId))return ack({ok:false});room.elapsedTicks=Math.max(0,Number(data?.elapsedTicks)||0)|0;room.overtime=!!data?.overtime;room.redScore=Math.max(0,Number(data?.redScore)||0)|0;room.blueScore=Math.max(0,Number(data?.blueScore)||0)|0;ack({ok:true});});
   socket.on('room:hostFinish',(data,ack=()=>{})=>{const room=getRoom(socket);if(!room||socket.id!==(room.hostSocketId||room.ownerSocketId))return ack({ok:false});const team=Number(data?.team);if(team!==1&&team!==2)return ack({ok:false});finishGame(room,team);ack({ok:true});});
   socket.on('room:setPassword',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.password=cleanText(data?.password,30);broadcastRoomState(room);ack({ok:true});});
   socket.on('room:clearBans',(_,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false});room.bannedNames.clear();ack({ok:true});});
   socket.on('room:partido',(data,ack=()=>{})=>{const room=getRoom(socket),actor=requireAdmin(socket,room);if(!room||!actor)return ack({ok:false,error:'Solo admin.'});const id=String(data?.id||'').toLowerCase();if(id==='normal')room.teamKits=clone(DEFAULT_TEAM_KITS);else if(PARTIDOS[id])room.teamKits={1:clone(PARTIDOS[id].red),2:clone(PARTIDOS[id].blue)};else return ack({ok:false,error:'Partido desconocido.'});broadcastRoomState(room);ack({ok:true,name:id==='normal'?'Normal':PARTIDOS[id].name});});
-  socket.on('disconnect',()=>{leaveCurrentRoom(socket,'disconnect').catch(()=>{});});
+  socket.on('disconnect',()=>{leaveCurrentRoom(socket,'leave').catch(()=>{});});
 });
 
 setInterval(()=>{for(const room of rooms.values())io.to(roomChannel(room.id)).emit('room:pings',room.players.filter(p=>!p.bot).map(p=>[p.id,p.ping|0]));},1200);
