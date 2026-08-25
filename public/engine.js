@@ -371,14 +371,23 @@ class World{
       const accel=this.kickFlag[k]?d.kickAccel:d.accel;
       d.vel[0]+=nx*accel;d.vel[1]+=ny*accel;
     }
-    // Comba autoritativa. Curve Bot v2 aplica una gravedad lateral durante 1.6 s;
-    // acá hacemos el equivalente en nuestro motor: aceleración perpendicular fija,
-    // que crece suavemente al inicio. No es un efecto de render y todos ven la misma ruta.
-    if(this.ballCurveTicks>0&&this.ballCurveIntensity>0&&Array.isArray(this.ballCurveDir)){
+    // Comba autoritativa. Conservamos el SENTIDO de giro, pero la aceleración lateral
+    // se recalcula perpendicular a la velocidad ACTUAL de la pelota. Esto es clave tras
+    // un rebote en pared/poste: la colisión decide la nueva trayectoria y, desde el tick
+    // siguiente, la comba continúa sobre esa trayectoria nueva en vez de empujar hacia
+    // una dirección absoluta vieja (que podía pegar/frenar/acelerar raro contra paredes).
+    if(this.ballCurveTicks>0&&this.ballCurveIntensity>0){
       const cb=this.discs[0],elapsed=(Math.max(0,(this.ballCurveTotalTicks||96)-this.ballCurveTicks))/60;
       const increasing=(Math.min(elapsed*3,.7)*(1+this.ballCurveIntensity*4))/1.6;
-      const lateral=.05*increasing;
-      cb.vel[0]+=this.ballCurveDir[0]*lateral;cb.vel[1]+=this.ballCurveDir[1]*lateral;
+      const speed=SQRT(cb.vel[0],cb.vel[1]),sign=this.ballCurveSpin>=0?1:-1;
+      if(speed>.0001){
+        const tx=cb.vel[0]/speed,ty=cb.vel[1]/speed;
+        // Unit normal to current trajectory; therefore the curve force stays lateral
+        // and does not artificially add/remove forward speed after a bounce.
+        this.ballCurveDir=[-ty*sign,tx*sign];
+        const lateral=.05*increasing;
+        cb.vel[0]+=this.ballCurveDir[0]*lateral;cb.vel[1]+=this.ballCurveDir[1]*lateral;
+      }
       this.ballCurveTicks--;
       if(this.ballCurveTicks<=0){this.ballCurveSpin=0;this.ballCurveTicks=0;this.ballCurveTotalTicks=0;this.ballCurveIntensity=0;this.ballCurveDir=[0,0];}
     }
