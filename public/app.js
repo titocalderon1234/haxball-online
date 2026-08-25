@@ -631,22 +631,32 @@ function render(){
     drawDisc(snap[0],colorToCss(snap[0]?.color,'#f5f5f5'),cam,sx,sy,false,'');
     for(let i=world.firstPlayer;i<snap.length;i++){
       const d=snap[i],p=players.find(x=>x.id===d.playerId);if(!p)continue;
-      const k=world.kickFlag[i-world.firstPlayer]||d.kick;if(k)drawKickEffect(d,snap[0],cam,sx,sy);
+      const k=!!(world.kickFlag[i-world.firstPlayer]||d.kick);
+      // En HaxBall el jugador local lleva siempre un aro completo translúcido que
+      // permite identificarlo. No es un abanico/arco apuntando hacia la pelota.
+      if(p.id===myPlayerId)drawLocalPlayerRing(d,cam,sx,sy);
       // p.team usa el contrato de sala (1=Rojo, 2=Azul). d.team usa flags de
       // física (2=RED, 4=BLUE), por eso usar d.team como índice invertía los kits.
-      drawPlayerDisc(d,teamKits[p.team]||DEFAULT_TEAM_KITS[p.team]||DEFAULT_TEAM_KITS[1],cam,sx,sy,p.avatar||String(p.id));
-      if(settings.showNames){const fs=clamp(11*cam.scale,10,15);ctx.font=`${fs}px Arial`;ctx.textAlign='center';ctx.textBaseline='top';ctx.lineWidth=3;ctx.strokeStyle='rgba(0,0,0,.72)';ctx.fillStyle='#fff';const yy=sy(d.y-d.r)+4;ctx.strokeText(p.name,sx(d.x),yy);ctx.fillText(p.name,sx(d.x),yy);}
+      drawPlayerDisc(d,teamKits[p.team]||DEFAULT_TEAM_KITS[p.team]||DEFAULT_TEAM_KITS[1],cam,sx,sy,p.avatar||String(p.id),k);
+      // Igual que en HaxBall: el cliente no imprime su propio nick debajo de su
+      // disco, pero sí puede mostrar los nombres de los demás jugadores.
+      if(settings.showNames&&p.id!==myPlayerId){const fs=clamp(11*cam.scale,10,15);ctx.font=`${fs}px Arial`;ctx.textAlign='center';ctx.textBaseline='top';ctx.lineWidth=3;ctx.strokeStyle='rgba(0,0,0,.72)';ctx.fillStyle='#fff';const yy=sy(d.y-d.r)+4;ctx.strokeText(p.name,sx(d.x),yy);ctx.fillText(p.name,sx(d.x),yy);}
     }
   }
 }
-function drawKickEffect(d,ball,cam,sx,sy){
-  if(!ball)return;
-  const x=sx(d.x),y=sy(d.y),bx=sx(ball.x),by=sy(ball.y),a=Math.atan2(by-y,bx-x);
-  ctx.save();ctx.strokeStyle='rgba(238,238,238,.72)';ctx.lineCap='round';
-  for(let q=0;q<3;q++){ctx.beginPath();ctx.lineWidth=Math.max(1,1.05*cam.scale);ctx.arc(x,y,(d.r+3+q*3)*cam.scale,a-.46,a+.46);ctx.stroke();}
-  ctx.restore();
+function drawLocalPlayerRing(d,cam,sx,sy){
+  if(!d)return;
+  const x=sx(d.x),y=sy(d.y);
+  // La referencia tiene un aro de ~1.65 veces el radio del jugador. Con el radio
+  // normal de 15 equivale prácticamente a d.r + 10, y escala correctamente con
+  // zooms/mapas sin alterar nada de la física.
+  const rr=(d.r+10)*cam.scale;
+  ctx.save();ctx.beginPath();ctx.arc(x,y,rr,0,Math.PI*2);
+  ctx.lineWidth=Math.max(2,2.15*cam.scale);
+  ctx.strokeStyle='rgba(255,255,255,.28)';
+  ctx.stroke();ctx.restore();
 }
-function drawPlayerDisc(d,kit,cam,sx,sy,label){
+function drawPlayerDisc(d,kit,cam,sx,sy,label,kicking=false){
   if(!d)return;kit=cloneKit(kit);const r=d.r*cam.scale,x=sx(d.x),y=sy(d.y),colors=kit.colors.map(c=>'#'+c);
   ctx.save();ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.clip();
   ctx.translate(x,y);ctx.rotate((kit.angle||0)*Math.PI/180);
@@ -655,7 +665,9 @@ function drawPlayerDisc(d,kit,cam,sx,sy,label){
   const span=r*4,n=Math.max(1,colors.length),stripe=span/n;
   for(let i=0;i<n;i++){ctx.fillStyle=colors[i];ctx.fillRect(-span/2+i*stripe,-span/2,stripe+.7,span);}
   ctx.restore();
-  ctx.save();ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.lineWidth=Math.max(1.35,1.4*cam.scale);ctx.strokeStyle='#242424';ctx.stroke();
+  // Sin patear: borde oscuro. Mientras se mantiene la patada: borde blanco, como
+  // en las dos referencias. El aro exterior del jugador local no cambia.
+  ctx.save();ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.lineWidth=Math.max(1.7,2*cam.scale);ctx.strokeStyle=kicking?'#ffffff':'#171717';ctx.stroke();
   if(label){const avatarSize=clamp((label.length>1?9.4:10.7)*cam.scale,11,18);ctx.fillStyle='#'+cleanHex(kit.textColor);ctx.font=`bold ${avatarSize}px Arial`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.shadowColor='#000';ctx.shadowBlur=.7;ctx.fillText(label,x,y+.5);ctx.shadowBlur=0;}ctx.restore();
 }
 function drawDisc(d,color,cam,sx,sy,player,label){
