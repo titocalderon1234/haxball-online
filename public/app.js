@@ -59,6 +59,7 @@ stadiumTiles.grass.onload=stadiumTiles.hockey.onload=()=>{try{render();}catch{}}
 function readJSON(k,fallback){try{return JSON.parse(localStorage.getItem(k)||'null')||fallback}catch{return fallback}}
 function saveSettings(){try{localStorage.setItem('hbLocalV2Settings',JSON.stringify(settings));}catch{}}
 function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function limitAvatarGlyphs(v,max=2){const str=String(v??'').replace(/[\r\n\t]/g,'');try{if(typeof Intl!=='undefined'&&Intl.Segmenter){const seg=new Intl.Segmenter(undefined,{granularity:'grapheme'});return [...seg.segment(str)].slice(0,max).map(x=>x.segment).join('');}}catch{}return Array.from(str).slice(0,max).join('');}
 function colorToCss(value,fallback='#000000'){
   if(value==null)return fallback;
   if(Array.isArray(value)&&value.length>=3)return `rgb(${clamp(+value[0]||0,0,255)},${clamp(+value[1]||0,0,255)},${clamp(+value[2]||0,0,255)})`;
@@ -87,6 +88,7 @@ function detectLocalCountry(){
 }
 function normalizeLocalProfile(){
   if(!validCountry(settings.country)){settings.country=detectLocalCountry();settings.countryAuto=true;saveSettings();}
+  settings.avatar=limitAvatarGlyphs(settings.avatar,2);
   if(typeof settings.avatarImage!=='string')settings.avatarImage='';
 }
 function profilePayload(extra={}){return Object.assign({name:settings.nick,avatar:settings.avatar,avatarImage:settings.avatarImage||'',country:validCountry(settings.country)?settings.country:'XX'},extra);}
@@ -256,8 +258,11 @@ function hostActions(localAct){
   }
   const controllerId=currentBallController();let controllerTicks=0,controllerMode=false;
   for(const p of players){
-    if(!activeIds.has(p.id))continue;const raw=rawById.get(p.id)||[0,0,0,0,0],curveOn=!!raw[3],powerOn=!!raw[4];let st=specialChargeState.get(p.id);if(!st){st={controlTicks:0};specialChargeState.set(p.id,st);}
-    if(p.id===controllerId&&(curveOn||powerOn)){st.controlTicks=Math.min(SPECIAL_RED_TICKS,st.controlTicks+1);controllerTicks=st.controlTicks;controllerMode=true;}
+    if(!activeIds.has(p.id))continue;const raw=rawById.get(p.id)||[0,0,0,0,0],curveOn=!!raw[3],powerOn=!!raw[4],mode=curveOn?'curve':powerOn?'power':'none';let st=specialChargeState.get(p.id);if(!st){st={controlTicks:0,mode};specialChargeState.set(p.id,st);}
+    // El host es autoritativo también para el cambio /p <-> /c. Si el modo cambia,
+    // la carga anterior NO se hereda aunque el jugador siga controlando la pelota.
+    if(st.mode!==mode){st.controlTicks=0;st.mode=mode;if(specialControllerId===p.id){specialControllerGrace=0;}}
+    if(p.id===controllerId&&mode!=='none'){st.controlTicks=Math.min(SPECIAL_RED_TICKS,st.controlTicks+1);controllerTicks=st.controlTicks;controllerMode=true;}
     else st.controlTicks=0;
     const charge=specialStrength(st.controlTicks);
     // /c = mismo golpe fuerte que /p + comba. /p = solo potencia.
@@ -430,7 +435,7 @@ function resetToLobby(){
 function leaveRoom(){socket.emit('room:leave',{},()=>resetToLobby());}
 $('#leaveRoomBtn').onclick=leaveRoom;
 $('#roomMenuBtn').onclick=()=>setRoomMenu(!menuOpen);
-function setRoomMenu(open){menuOpen=!!open;$('#roomMenu').classList.toggle('closed',!menuOpen);keys.clear();hidePlayerContext();syncGameViewState();}
+function setRoomMenu(open){menuOpen=!!open;$('#roomMenu').classList.toggle('closed',!menuOpen);if(!gameRunning)keys.clear();hidePlayerContext();syncGameViewState();}
 socket.on('room:state',st=>{if(room.id===st?.id)applyRoomState(st);});
 socket.on('room:pings',list=>{if(!Array.isArray(list))return;for(const [id,ping] of list){const p=players.find(x=>x.id===id);if(p)p.ping=ping|0;}if(menuOpen)renderPlayers();});
 
@@ -498,9 +503,9 @@ function runCommand(raw){
   const prefix=raw[0],body=raw.slice(1).trim(),[cmdRaw,...rest]=body.split(/\s+/),arg=rest.join(' '),me=human(),cmd=(cmdRaw||'').toLowerCase();
   if(prefix==='!'){if(cmd==='help'){showHelp();return;}addSystem(`Comando desconocido: !${cmd}. Escribí !help.`);return;}
   switch(cmd){
-    case 'c':{const next=!specialModes.curve;specialModes.curve=next;specialModes.power=false;resetSpecialCharge(myPlayerId);addSystem(`Modo COMBA ${next?'activado':'desactivado'}.${next?' La carga empieza solamente mientras controlás la pelota: 2 s amarillo, 3 s naranja, 3.5 s rojo.':''}`);break;}
-    case 'p':{const next=!specialModes.power;specialModes.power=next;specialModes.curve=false;resetSpecialCharge(myPlayerId);addSystem(`Modo POWERSHOT ${next?'activado':'desactivado'}.${next?' La carga empieza solamente mientras controlás la pelota: 2 s amarillo, 3 s naranja, 3.5 s rojo.':''}`);break;}
-    case 'avatar':settings.avatar=arg.slice(0,2);saveSettings();socket.emit('profile:update',profilePayload());syncSettingsFields();break;
+    case 'c':{const wasPower=specialModes.power,next=!specialModes.curve;specialModes.curve=next;specialModes.power=false;resetSpecialCharge(myPlayerId);addSystem(next?`Modo COMBA activado${wasPower?' (Powershot desactivado).':'.'} La carga vuelve a 0 y empieza mientras controlás la pelota: 2 s amarillo, 3 s naranja, 3.5 s rojo.`:'Modo COMBA desactivado.');break;}
+    case 'p':{const wasCurve=specialModes.curve,next=!specialModes.power;specialModes.power=next;specialModes.curve=false;resetSpecialCharge(myPlayerId);addSystem(next?`Modo POWERSHOT activado${wasCurve?' (Comba desactivada).':'.'} La carga vuelve a 0 y empieza mientras controlás la pelota: 2 s amarillo, 3 s naranja, 3.5 s rojo.`:'Modo POWERSHOT desactivado.');break;}
+    case 'avatar':settings.avatar=limitAvatarGlyphs(arg,2);saveSettings();socket.emit('profile:update',profilePayload());syncSettingsFields();break;
     case 'clear_avatar':settings.avatar='';saveSettings();socket.emit('profile:update',profilePayload({avatar:''}));syncSettingsFields();break;
     case 'extrapolation':settings.extrapolation=clamp(parseInt(rest[0],10)||0,0,1000);settings.extrapolationTouched=true;saveSettings();addSystem(`Extrapolation: ${settings.extrapolation} ms.`);syncSettingsFields();break;
     case 'set_password':if(!me?.admin){addSystem('Solo un admin puede cambiar la contraseña.');break;}socket.emit('room:setPassword',{password:arg});break;
@@ -529,8 +534,10 @@ window.addEventListener('keydown',e=>{
   if(e.key==='Escape'&&!$('#gameView').classList.contains('hidden')){e.preventDefault();setRoomMenu(!menuOpen);return;}
   if(e.key==='p'||e.key==='P'){togglePause();return;}
   if(['1','2','3','4','0'].includes(e.key)&&!menuOpen){const map={'1':'1','2':'1.25','3':'1.5','4':'1.75','0':'fit'};settings.view=map[e.key];saveSettings();syncSettingsFields();return;}
+  // Igual que en HaxBall: abrir el menú de sala durante una partida no bloquea
+  // los controles. Los INPUT/SELECT siguen capturando el teclado por las guardas de arriba.
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','x','X'].includes(e.key)){e.preventDefault();keys.add(e.key);return;}
   if(menuOpen)return;
-  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','x','X'].includes(e.key)){e.preventDefault();keys.add(e.key);}
 });
 window.addEventListener('keyup',e=>keys.delete(e.key));window.addEventListener('blur',()=>keys.clear());
 
@@ -566,7 +573,7 @@ function applySettingsToUI(){
 }
 $('#saveSettings').onclick=()=>{
   const previousLowLatency=settings.lowLatency!==false,previousExtrapolation=settings.extrapolation;
-  settings.nick=$('#setNick').value.trim()||'Jugador';settings.avatar=$('#setAvatar').value.slice(0,2);settings.extrapolation=clamp(parseInt($('#setExtrap').value,10)||0,0,1000);if(settings.extrapolation!==previousExtrapolation)settings.extrapolationTouched=true;settings.showChat=$('#setShowChat').checked;settings.showNames=$('#setShowNames').checked;settings.sound=$('#setSound').checked;settings.lowLatency=$('#setLowLatency').checked;settings.view=$('#setView').value;settings.fps=$('#setFps').value;settings.chatOpacity=clamp(+$('#setChatOpacity').value,20,95);settings.chatWidth=$('#setChatWidth').value;settings.chatHeight=clamp(+$('#setChatHeight').value,140,420);settings.volume=+$('#volumeSlider').value;
+  settings.nick=$('#setNick').value.trim()||'Jugador';settings.avatar=limitAvatarGlyphs($('#setAvatar').value,2);settings.extrapolation=clamp(parseInt($('#setExtrap').value,10)||0,0,1000);if(settings.extrapolation!==previousExtrapolation)settings.extrapolationTouched=true;settings.showChat=$('#setShowChat').checked;settings.showNames=$('#setShowNames').checked;settings.sound=$('#setSound').checked;settings.lowLatency=$('#setLowLatency').checked;settings.view=$('#setView').value;settings.fps=$('#setFps').value;settings.chatOpacity=clamp(+$('#setChatOpacity').value,20,95);settings.chatWidth=$('#setChatWidth').value;settings.chatHeight=clamp(+$('#setChatHeight').value,140,420);settings.volume=+$('#volumeSlider').value;
   $('#nickInput').value=settings.nick;saveSettings();if(room.id)socket.emit('profile:update',profilePayload());if(previousLowLatency!==(settings.lowLatency!==false))recreateCanvas();applySettingsToUI();closeSettings();
 };
 $('#volumeSlider').oninput=e=>{settings.volume=+e.target.value;saveSettings();};
@@ -774,7 +781,7 @@ function render(){
       if(p.id===myPlayerId)drawLocalPlayerRing(d,cam,sx,sy);
       // p.team usa el contrato de sala (1=Rojo, 2=Azul). d.team usa flags de
       // física (2=RED, 4=BLUE), por eso usar d.team como índice invertía los kits.
-      drawPlayerDisc(d,teamKits[p.team]||DEFAULT_TEAM_KITS[p.team]||DEFAULT_TEAM_KITS[1],cam,sx,sy,p.avatar||String(p.id),k,p.avatarImage||'');
+      drawPlayerDisc(d,teamKits[p.team]||DEFAULT_TEAM_KITS[p.team]||DEFAULT_TEAM_KITS[1],cam,sx,sy,p.avatar||String(p.id),k);
       // Igual que en HaxBall: el cliente no imprime su propio nick debajo de su
       // disco, pero sí puede mostrar los nombres de los demás jugadores.
       if(settings.showNames&&p.id!==myPlayerId){const fs=clamp(11*cam.scale,10,15);ctx.font=`${fs}px Arial`;ctx.textAlign='center';ctx.textBaseline='top';ctx.lineWidth=3;ctx.strokeStyle='rgba(0,0,0,.72)';ctx.fillStyle='#fff';const yy=sy(d.y-d.r)+4;ctx.strokeText(p.name,sx(d.x),yy);ctx.fillText(p.name,sx(d.x),yy);}
@@ -793,7 +800,7 @@ function drawLocalPlayerRing(d,cam,sx,sy){
   ctx.strokeStyle='rgba(255,255,255,.28)';
   ctx.stroke();ctx.restore();
 }
-function drawPlayerDisc(d,kit,cam,sx,sy,label,kicking=false,avatarImage=''){
+function drawPlayerDisc(d,kit,cam,sx,sy,label,kicking=false){
   if(!d)return;kit=cloneKit(kit);const r=d.r*cam.scale,x=sx(d.x),y=sy(d.y),colors=kit.colors.map(c=>'#'+c);
   ctx.save();ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.clip();
   ctx.translate(x,y);ctx.rotate((kit.angle||0)*Math.PI/180);
@@ -805,13 +812,14 @@ function drawPlayerDisc(d,kit,cam,sx,sy,label,kicking=false,avatarImage=''){
   // Sin patear: borde oscuro. Mientras se mantiene la patada: borde blanco, como
   // en las dos referencias. El aro exterior del jugador local no cambia.
   ctx.save();ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.lineWidth=Math.max(1.7,2*cam.scale);ctx.strokeStyle=kicking?'#ffffff':'#171717';ctx.stroke();
-  const custom=getAvatarImage(avatarImage);if(custom&&custom.complete&&custom.naturalWidth){const ir=r*.36;ctx.save();ctx.beginPath();ctx.arc(x,y,ir,0,Math.PI*2);ctx.clip();ctx.drawImage(custom,x-ir,y-ir,ir*2,ir*2);ctx.restore();}
-  else if(label){const avatarSize=clamp((label.length>1?9.4:10.7)*cam.scale,11,18);ctx.fillStyle='#'+cleanHex(kit.textColor);ctx.font=`bold ${avatarSize}px Arial`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.shadowColor='#000';ctx.shadowBlur=.7;ctx.fillText(label,x,y+.5);ctx.shadowBlur=0;}ctx.restore();
+  // Dentro del disco solo va el avatar clásico de HaxBall (texto/símbolo/emoji, máx. 2).
+  // La imagen personalizada es un ICONO de perfil y se muestra únicamente en menús/listas.
+  if(label){const avatarSize=clamp((label.length>1?11.2:12.4)*cam.scale,11.5,20);ctx.fillStyle='#'+cleanHex(kit.textColor);ctx.font=`bold ${avatarSize}px Arial`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.shadowColor='#000';ctx.shadowBlur=.7;ctx.fillText(label,x,y+.5);ctx.shadowBlur=0;}ctx.restore();
 }
 function drawDisc(d,color,cam,sx,sy,player,label){
   if(!d)return;const r=d.r*cam.scale,x=sx(d.x),y=sy(d.y);ctx.save();ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
   ctx.lineWidth=Math.max(1.35,1.4*cam.scale);ctx.strokeStyle='#242424';ctx.stroke();
-  if(player&&label){const avatarSize=clamp((label.length>1?9.4:10.7)*cam.scale,11,18);ctx.fillStyle='#fff';ctx.font=`bold ${avatarSize}px Arial`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.shadowColor='#000';ctx.shadowBlur=.7;ctx.fillText(label,x,y+.5);ctx.shadowBlur=0;}ctx.restore();
+  if(player&&label){const avatarSize=clamp((label.length>1?11.2:12.4)*cam.scale,11.5,20);ctx.fillStyle='#fff';ctx.font=`bold ${avatarSize}px Arial`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.shadowColor='#000';ctx.shadowBlur=.7;ctx.fillText(label,x,y+.5);ctx.shadowBlur=0;}ctx.restore();
 }
 function updateGameAnnouncement(){
   const box=$('#gameAnnouncement'),txt=$('#gameAnnouncementText');if(!box||!txt)return;
