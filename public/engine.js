@@ -182,7 +182,7 @@ class World{
     this.stadium=JSON.parse(JSON.stringify(stadium||CLASSIC));
     this.players=players.filter(p=>p.team===1||p.team===2).map(p=>Object.assign({},p));
     this.discs=[];this.vertices=[];this.segments=[];this.planes=[];this.goals=[];this.playerIndexById=new Map();
-    this.redScore=0;this.blueScore=0;this.steps=0;this.state=STATE_KICKOFF;this.kickingTeam=F.RED;this.goalTimer=0;this.ballCurveSpin=0;this.ballCurveTicks=0;
+    this.redScore=0;this.blueScore=0;this.steps=0;this.state=STATE_KICKOFF;this.kickingTeam=F.RED;this.goalTimer=0;this.ballCurveSpin=0;this.ballCurveTicks=0;this.ballCurveTotalTicks=0;this.ballCurveIntensity=0;this.ballCurveDir=[0,0];this.ballBaseColor='FFFFFF';
     this.kickRateMin=2;this.kickRateCost=0;this.kickRateCap=1;this.lastGoalConceding=null;this.lastKickBy=null;this.lastBallKickBy=null;
     this.kickOffReset=(this.stadium.kickOffReset||'partial').toLowerCase()==='full'?'full':'partial';
     this._build();
@@ -202,7 +202,7 @@ class World{
     // ballPhysics is inline or points at discN. Physics values still come from that object.
     const ballGroup=F.BALL|F.KICK|F.SCORE;
     const ballMask=F.ALL;
-    this.discs.push(makeDisc([0,0],ballRaw.radius??10,ballRaw.invMass??1,ballRaw.damping??.99,ballRaw.bCoef??.5,ballGroup,ballMask,{kind:'ball',color:ballRaw.color??'FFFFFF',vel:[bSpeed[0]||0,-(bSpeed[1]||0)],gravity:[bGravity[0]||0,-(bGravity[1]||0)]}));
+    this.ballBaseColor=String(ballRaw.color??'FFFFFF').replace(/^#/,'').padStart(6,'0').slice(-6).toUpperCase();this.discs.push(makeDisc([0,0],ballRaw.radius??10,ballRaw.invMass??1,ballRaw.damping??.99,ballRaw.bCoef??.5,ballGroup,ballMask,{kind:'ball',color:this.ballBaseColor,vel:[bSpeed[0]||0,-(bSpeed[1]||0)],gravity:[bGravity[0]||0,-(bGravity[1]||0)]}));
     (s.discs||[]).forEach((raw,i)=>{
       if(i===ballDiscIndex)return;
       const p=mergeProps(raw,raw.trait?traits[raw.trait]:null),pos=p.pos||[0,0],speed=p.speed||[0,0],gravity=p.gravity||[0,0];
@@ -245,7 +245,7 @@ class World{
   resetPositions(){
     // The game ball always returns to center on kickoff. With full reset all
     // custom/moving stadium discs return to the exact position/speed authored in .hbs.
-    this.discs[0].pos=[0,0];this.discs[0].vel=[0,0];this.ballCurveSpin=0;this.ballCurveTicks=0;
+    this.discs[0].pos=[0,0];this.discs[0].vel=[0,0];this.discs[0].color=this.ballBaseColor;this.ballCurveSpin=0;this.ballCurveTicks=0;this.ballCurveTotalTicks=0;this.ballCurveIntensity=0;this.ballCurveDir=[0,0];
     if(this.kickOffReset==='full'){
       for(let i=1;i<this.firstPlayer;i++){
         const st=this.initialNonPlayer?.[i];if(!st)continue;
@@ -266,7 +266,7 @@ class World{
     w.stadium=this.stadium;w.players=this.players.map(p=>Object.assign({},p));
     w.discs=this.discs.map(d=>Object.assign({},d,{pos:d.pos.slice(),vel:d.vel.slice(),gravity:d.gravity.slice()}));
     w.vertices=this.vertices;w.segments=this.segments;w.planes=this.planes;w.goals=this.goals;w.playerIndexById=new Map(this.playerIndexById);
-    w.redScore=this.redScore;w.blueScore=this.blueScore;w.steps=this.steps;w.state=this.state;w.kickingTeam=this.kickingTeam;w.goalTimer=this.goalTimer;w.ballCurveSpin=this.ballCurveSpin||0;w.ballCurveTicks=this.ballCurveTicks||0;
+    w.redScore=this.redScore;w.blueScore=this.blueScore;w.steps=this.steps;w.state=this.state;w.kickingTeam=this.kickingTeam;w.goalTimer=this.goalTimer;w.ballCurveSpin=this.ballCurveSpin||0;w.ballCurveTicks=this.ballCurveTicks||0;w.ballCurveTotalTicks=this.ballCurveTotalTicks||0;w.ballCurveIntensity=this.ballCurveIntensity||0;w.ballCurveDir=Array.isArray(this.ballCurveDir)?this.ballCurveDir.slice():[0,0];w.ballBaseColor=this.ballBaseColor||'FFFFFF';
     w.kickRateMin=this.kickRateMin;w.kickRateCost=this.kickRateCost;w.kickRateCap=this.kickRateCap;w.lastGoalConceding=null;w.lastKickBy=null;w.lastBallKickBy=null;
     w.firstPlayer=this.firstPlayer;w.nPlayers=this.nPlayers;w.spawnDistance=this.spawnDistance;w.redSpawn=this.redSpawn;w.blueSpawn=this.blueSpawn;w.kickOffReset=this.kickOffReset;
     w.initialNonPlayer=this.initialNonPlayer.map(x=>({pos:x.pos.slice(),vel:x.vel.slice()}));
@@ -336,27 +336,30 @@ class World{
         if(di===pi)continue;const target=this.discs[di];if((target.cgroup&F.KICK)===0)continue;
         const dx=target.pos[0]-px,dy=target.pos[1]-py,dist=SQRT(dx,dy);
         if(dist-target.radius-pr<4 && kickAllowed && dist>0){
-          const nx=dx/dist,ny=dy/dist,curveCharge=clamp(Number(act[3])||0,0,1),powerCharge=clamp(Number(act[4])||0,0,1);
-          // /p starts as a normal kick during the 2.5 s wait. Once charged, its
-          // authoritative impulse grows progressively up to 1.85x at full charge.
-          // Custom kickable discs keep their authored/default kick behavior.
-          const powerMul=target.kind==='ball'?(1+.85*powerCharge):1;
+          const nx=dx/dist,ny=dy/dist,curveCharge=clamp(Number(act[3])||0,0,1),powerCharge=clamp(Number(act[4])||0,0,1),specialCharge=Math.max(curveCharge,powerCharge);
+          // Basado en implementaciones de Curve/Power de la comunidad: el golpe fuerte
+          // ronda 1.4x y la curva cargada llega aproximadamente a 1.5-1.6x. Usamos 1.50x
+          // como máximo estable y lo aplicamos RELATIVO al kickStrength de cada estadio.
+          const powerMul=target.kind==='ball'?(1+.50*specialCharge):1;
           target.vel[0]+=nx*ks*powerMul*target.invMass;target.vel[1]+=ny*ks*powerMul*target.invMass;
           d.vel[0]+=nx*-kb*pim;d.vel[1]+=ny*-kb*pim;
           if(target.kind==='ball'){
             if(curveCharge>0){
-              // /c also has a charge curve: first no effect, then progressively more
-              // angular spin and duration. Direction follows lateral movement; if the
-              // player is straight/still, use a deterministic team-side curl.
+              // Dirección como Curve Bot v2: perpendicular al disparo, elegida por el
+              // movimiento lateral del jugador. Si patea completamente recto/parado,
+              // elegimos un lado determinista para que /c SIEMPRE produzca comba visible.
               const mix=Number(act[0])||0,miy=Number(act[1])||0;
-              let side=nx*miy-ny*mix;
-              if(Math.abs(side)<.12)side=nx*d.vel[1]-ny*d.vel[0];
-              if(Math.abs(side)<.045)side=pl.team===1?1:-1;
-              this.ballCurveSpin=(side<0?-1:1)*(.0045+.0115*curveCharge);
-              this.ballCurveTicks=Math.round(30+60*curveCharge);
+              let side=(-ny)*mix+nx*miy;
+              if(Math.abs(side)<.10)side=(-ny)*d.vel[0]+nx*d.vel[1];
+              if(Math.abs(side)<.04)side=pl.team===1?1:-1;
+              const sign=side>=0?1:-1;
+              this.ballCurveDir=[-ny*sign,nx*sign];
+              this.ballCurveIntensity=clamp(.25+.55*curveCharge,.25,.80);
+              this.ballCurveSpin=sign*curveCharge; // se conserva para snapshots/versiones anteriores
+              this.ballCurveTotalTicks=96; // 1.6 s a 60 Hz, igual que Curve Bot v2
+              this.ballCurveTicks=this.ballCurveTotalTicks;
             }else{
-              // A normal/unready touch cancels previous curl.
-              this.ballCurveSpin=0;this.ballCurveTicks=0;
+              this.ballCurveSpin=0;this.ballCurveTicks=0;this.ballCurveTotalTicks=0;this.ballCurveIntensity=0;this.ballCurveDir=[0,0];
             }
             if(!predictionOnly)this.lastBallKickBy=pl.id;
           }
@@ -368,16 +371,16 @@ class World{
       const accel=this.kickFlag[k]?d.kickAccel:d.accel;
       d.vel[0]+=nx*accel;d.vel[1]+=ny*accel;
     }
-    // Curved-shot spin is part of the authoritative simulation, not a render trick.
-    // Rotate ball velocity a little each 60 Hz tick and decay the spin smoothly.
-    if(this.ballCurveTicks>0&&Math.abs(this.ballCurveSpin)>1e-5){
-      const cb=this.discs[0],speed=SQRT(cb.vel[0],cb.vel[1]);
-      if(speed>.04){
-        const a=this.ballCurveSpin*clamp(speed/7,.38,1.18),ca=Math.cos(a),sa=Math.sin(a),vx=cb.vel[0],vy=cb.vel[1];
-        cb.vel[0]=vx*ca-vy*sa;cb.vel[1]=vx*sa+vy*ca;
-      }
-      this.ballCurveSpin*=.966;this.ballCurveTicks--;
-      if(this.ballCurveTicks<=0||Math.abs(this.ballCurveSpin)<.00035){this.ballCurveSpin=0;this.ballCurveTicks=0;}
+    // Comba autoritativa. Curve Bot v2 aplica una gravedad lateral durante 1.6 s;
+    // acá hacemos el equivalente en nuestro motor: aceleración perpendicular fija,
+    // que crece suavemente al inicio. No es un efecto de render y todos ven la misma ruta.
+    if(this.ballCurveTicks>0&&this.ballCurveIntensity>0&&Array.isArray(this.ballCurveDir)){
+      const cb=this.discs[0],elapsed=(Math.max(0,(this.ballCurveTotalTicks||96)-this.ballCurveTicks))/60;
+      const increasing=(Math.min(elapsed*3,.7)*(1+this.ballCurveIntensity*4))/1.6;
+      const lateral=.05*increasing;
+      cb.vel[0]+=this.ballCurveDir[0]*lateral;cb.vel[1]+=this.ballCurveDir[1]*lateral;
+      this.ballCurveTicks--;
+      if(this.ballCurveTicks<=0){this.ballCurveSpin=0;this.ballCurveTicks=0;this.ballCurveTotalTicks=0;this.ballCurveIntensity=0;this.ballCurveDir=[0,0];}
     }
     // Any disc carrying the `score` collision flag can cross a goal line and score.
     // Standard maps only give it to the ball, but custom .hbs files may use it elsewhere.
