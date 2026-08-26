@@ -248,6 +248,22 @@
     </div>
   </div>
 
+
+  <!-- In-game HaxBall-style interaction dialog (replaces browser alert/prompt boxes) -->
+  <div id="interactionModal" class="modal-backdrop interaction-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="interactionTitle">
+    <div class="interaction-dialog">
+      <div class="interaction-head"><h1 id="interactionTitle">Aviso</h1></div>
+      <div class="interaction-body">
+        <p id="interactionMessage"></p>
+        <input id="interactionInput" class="interaction-input hidden" maxlength="120" autocomplete="off">
+      </div>
+      <div class="interaction-actions">
+        <button id="interactionCancel" class="hb-button hidden">Cancelar</button>
+        <button id="interactionOk" class="hb-button primary">Aceptar</button>
+      </div>
+    </div>
+  </div>
+
     <input id="stadiumFile" class="hidden" type="file" accept=".hbs,.json,application/json">
   <input id="avatarImageFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp">
 </div>
