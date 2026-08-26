@@ -377,7 +377,18 @@ function rebuildHostWorld(oldWorld){
   return nw;
 }
 function hostStep(localAct){
-  if(!isHost()||!gameRunning||paused||endingGame||!world)return;lastActions=hostActions(localAct);const r=world.step(lastActions);elapsedTicks++;if(r.ballKickBy!=null){resetSpecialCharge(r.ballKickBy);if(world.discs?.[0])world.discs[0].color=normalizeHex6(world.ballBaseColor||'FFFFFF');}
+  if(!isHost()||!gameRunning||paused||endingGame||!world)return;
+  // HaxBall's match clock is PLAY time, not wall-clock time. It stays at 00:00 on
+  // the opening kickoff until somebody actually touches/moves the ball. After a goal
+  // it freezes through the goal animation and the next kickoff, then resumes on the
+  // first new touch. World.state already gives us exactly those phases.
+  const stateBefore=world.state;
+  lastActions=hostActions(localAct);
+  const r=world.step(lastActions);
+  const clockWasRunning=stateBefore===E.STATE_PLAYING;
+  const clockStartedThisTick=stateBefore===E.STATE_KICKOFF&&world.state===E.STATE_PLAYING;
+  if(clockWasRunning||clockStartedThisTick)elapsedTicks++;
+  if(r.ballKickBy!=null){resetSpecialCharge(r.ballKickBy);if(world.discs?.[0])world.discs[0].color=normalizeHex6(world.ballBaseColor||'FFFFFF');}
   if(r.goalConceding){const scoring=r.goalConceding===F.RED?2:1;goalScoringTeam=scoring;socket.emit('room:hostMeta',{elapsedTicks,overtime,redScore:world.redScore,blueScore:world.blueScore});if((room.scoreLimit||0)>0&&(world.redScore>=room.scoreLimit||world.blueScore>=room.scoreLimit))hostPendingWinner=world.redScore>world.blueScore?1:2;if(overtime)hostPendingWinner=scoring;}
   if(world.state!==E.STATE_GOAL&&!hostPendingWinner)goalScoringTeam=0;
   if(hostPendingWinner&&world.state===E.STATE_KICKOFF&&!hostFinishing){hostFinishing=true;gameRunning=false;endingGame=true;finalWinner=hostPendingWinner;sendHostSnapshot(true);socket.emit('room:hostFinish',{team:hostPendingWinner});return;}
@@ -461,8 +472,8 @@ socket.on('rooms:list',list=>{onlineRooms=Array.isArray(list)?list:[];if(!select
   if(pendingRoomFromUrl&&$('#roomsView')&&!$('#roomsView').classList.contains('hidden')){const r=onlineRooms.find(x=>x.id===pendingRoomFromUrl);if(r){selectedRoomId=r.id;pendingRoomFromUrl=null;setTimeout(joinSelectedRoom,30);}}
 });
 socket.on('disconnect',()=>{if(room.id)interruptConnection();});
-socket.on('room:closed',data=>{const msg=data?.message||'La sala se cerró.';resetToLobby();haxNotice(msg,'Sala cerrada','warning');});
-socket.on('room:kicked',data=>{const banned=!!data?.ban;resetToLobby();haxNotice(banned?'Fuiste baneado de la sala.':'Fuiste expulsado de la sala.',banned?'Baneado':'Expulsado','danger');});
+socket.on('room:closed',data=>{const msg=data?.message||'La sala se cerró.';resetToLobby();setTimeout(()=>haxNotice(msg,'Sala cerrada','warning'),0);});
+socket.on('room:kicked',data=>{const banned=!!data?.ban;resetToLobby();setTimeout(()=>haxNotice(banned?'Fuiste baneado de la sala.':'Fuiste expulsado de la sala.',banned?'Baneado':'Expulsado','danger'),0);});
 socket.on('chat:message',m=>{if(!m)return;addChat(m.text||'',m.type||'system',m.name||'');});
 // El ping mostrado durante una sala se mide directo contra el host por WebRTC.
 /* ---------- room ---------- */
