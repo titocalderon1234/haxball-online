@@ -4,7 +4,7 @@ const E=window.HBEngine,F=E.F;
 const BUILTIN_STADIUMS=window.HB_BUILTIN_STADIUMS||{};
 const socket=window.io({transports:['websocket','polling']});
 const $=s=>document.querySelector(s),$$=s=>Array.from(document.querySelectorAll(s));
-const defaults={nick:'Jugador',avatar:'',avatarImage:'',country:'',countryAuto:true,extrapolation:0,extrapolationTouched:false,showChat:true,showNames:true,sound:true,lowLatency:true,view:'1',fps:'0',chatOpacity:72,chatWidth:'compact',chatHeight:260,volume:70};
+const defaults={nick:'Jugador',avatar:'',avatarImage:'',country:'',countryAuto:true,extrapolation:0,extrapolationTouched:false,showChat:true,showNames:true,sound:true,lowLatency:true,view:'1',fps:'0',chatOpacity:56,chatWidth:'compact',chatHeight:260,volume:70};
 let settings=Object.assign({},defaults,readJSON('hbLocalV2Settings',{}));
 // V2-V7 defaulted to a whole-stadium fit view. HaxBall's normal view is 1 world
 // unit per CSS pixel with a following camera; migrate the old untouched default once.
@@ -19,16 +19,17 @@ let menuOpen=true,teamsLocked=false,keys=new Set(),lastActions=new Map();
 let replayRecording=false,replayFrames=[];
 let contextPlayerId=null;
 let accumulator=0,lastFrame=performance.now(),lastRender=0,audioCtx=null,chatDrag=null;
-let prevPhysicsSnapshot=null,currPhysicsSnapshot=null,lastNetPacket=null,lastNetSnapshotAt=0,inputSeq=0,lastSentInput='',myPing=0;
-let peerLinks=new Map(),hostLink=null,peerInputs=new Map(),hostSnapshotDivider=0,hostMetaDivider=0,hostPendingWinner=0,hostFinishing=false;
-let connectionInterruptedHandled=false,hostInterruptTimer=null;
+let prevPhysicsSnapshot=null,currPhysicsSnapshot=null,lastNetPacket=null,lastNetSnapshotAt=0,lastAppliedNetTick=-1,inputSeq=0,lastSentInput='',myPing=0;
+let peerLinks=new Map(),hostLink=null,peerInputs=new Map(),earlyIce=new Map(),hostSnapshotDivider=0,hostMetaDivider=0,hostPendingWinner=0,hostFinishing=false;
+let connectionInterruptedHandled=false,hostInterruptTimer=null,hostRecoveryTimer=null,hostRecoveryDeadlineTimer=null,hostRecoveryAttempts=0,rtcRelayNoticeShown=false;
 let specialModes={curve:false,power:false},specialChargeState=new Map(),specialControllerId=null,specialControllerGrace=0;
 // La carga es por CONTROL CONTINUO de la pelota, no por tiempo desde que se escribió /c o /p.
 // 60 Hz: 2.0 s = amarillo, 3.0 s = naranja, 3.5 s = rojo/máximo.
 const SPECIAL_YELLOW_TICKS=120,SPECIAL_ORANGE_TICKS=180,SPECIAL_RED_TICKS=210;
 const SPECIAL_CONTROL_EXTRA=4,SPECIAL_CONTROL_GRACE_EXTRA=2,SPECIAL_CONTROL_GRACE_TICKS=3;
 const SPECIAL_COLOR_YELLOW='FFF200',SPECIAL_COLOR_ORANGE='FF8A00',SPECIAL_COLOR_RED='FF2D2D';
-const RTC_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}],iceCandidatePoolSize:2};
+let RTC_CONFIG={iceServers:[{urls:'stun:stun.cloudflare.com:3478'},{urls:'stun:stun.l.google.com:19302'}],iceCandidatePoolSize:2,iceTransportPolicy:'all'};
+let rtcConfigPromise=null;
 let pendingRoomFromUrl=new URLSearchParams(location.search).get('room')||null,lastJoinPassword='';
 
 // Team-color presets use HaxBall's /colors model: angle, avatar/text color, up to 3 stripes.
@@ -133,61 +134,140 @@ function beep(freq=450,dur=.035,gain=.035){
 function show(view){for(const id of ['nickView','roomsView','createView','gameView'])$('#'+id).classList.add('hidden');$('#'+view).classList.remove('hidden');$('#siteNav').classList.toggle('hidden',view==='gameView');}
 
 
+/* Browser-native alert/prompt dialogs break the HaxBall look. Use one async in-page dialog. */
+let interactionResolve=null,interactionLastFocus=null;
+function closeInteraction(value){
+  const modal=$('#interactionModal');if(!modal)return;if(modal.classList.contains('hidden'))return;
+  modal.classList.add('hidden');modal.querySelector('.interaction-dialog')?.classList.remove('danger','warning');
+  const done=interactionResolve;interactionResolve=null;try{interactionLastFocus?.focus?.();}catch{}interactionLastFocus=null;if(done)done(value);
+}
+function openInteraction({title='Aviso',message='',input=false,password=false,value='',cancel=false,tone=''}){
+  if(interactionResolve)closeInteraction(null);
+  interactionLastFocus=document.activeElement;keys.clear();
+  const modal=$('#interactionModal'),dlg=modal.querySelector('.interaction-dialog'),field=$('#interactionInput'),cancelBtn=$('#interactionCancel');
+  $('#interactionTitle').textContent=title;$('#interactionMessage').textContent=String(message||'');dlg.classList.remove('danger','warning');if(tone)dlg.classList.add(tone);
+  field.classList.toggle('hidden',!input);field.type=password?'password':'text';field.value=input?String(value??''):'';cancelBtn.classList.toggle('hidden',!cancel);modal.classList.remove('hidden');
+  setTimeout(()=>{(input?field:$('#interactionOk')).focus();if(input)field.select();},0);
+  return new Promise(resolve=>{interactionResolve=resolve;});
+}
+function haxNotice(message,title='Aviso',tone=''){return openInteraction({title,message,tone}).then(()=>true);}
+function haxPrompt(message,{title='Ingresar',value='',password=false}={}){return openInteraction({title,message,input:true,password,value,cancel:true}).then(v=>v===null?null:String(v));}
+$('#interactionOk').onclick=()=>closeInteraction($('#interactionInput').classList.contains('hidden')?true:$('#interactionInput').value);
+$('#interactionCancel').onclick=()=>closeInteraction(null);
+$('#interactionInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();closeInteraction(e.currentTarget.value);}else if(e.key==='Escape'){e.preventDefault();closeInteraction(null);}});
+$('#interactionModal').addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#interactionCancel').classList.contains('hidden')){e.preventDefault();closeInteraction(null);}});
+
+
 /* ---------- WebRTC host-authoritative gameplay ---------- */
 function isHost(){return !!room.id&&!!room.hostPeerId&&socket.id===room.hostPeerId;}
 function dcOpen(dc){return !!dc&&dc.readyState==='open';}
 function safeDcSend(dc,obj){if(!dcOpen(dc))return false;try{dc.send(JSON.stringify(obj));return true;}catch{return false;}}
-function clearHostInterruptTimer(){if(hostInterruptTimer){clearTimeout(hostInterruptTimer);hostInterruptTimer=null;}}
+function clearHostInterruptTimer(){if(hostInterruptTimer){clearTimeout(hostInterruptTimer);hostInterruptTimer=null;}if(hostRecoveryTimer){clearTimeout(hostRecoveryTimer);hostRecoveryTimer=null;}if(hostRecoveryDeadlineTimer){clearTimeout(hostRecoveryDeadlineTimer);hostRecoveryDeadlineTimer=null;}hostRecoveryAttempts=0;}
 function interruptConnection(message='La conexión se interrumpió.'){
   if(connectionInterruptedHandled||!room.id)return;
   connectionInterruptedHandled=true;clearHostInterruptTimer();keys.clear();
   try{if(socket.connected)socket.emit('room:leave');}catch{}
-  resetToLobby();setTimeout(()=>alert(message),0);
+  resetToLobby();setTimeout(()=>haxNotice(message,'Conexión interrumpida','warning'),0);
 }
-function scheduleHostInterrupt(link,delay=2400){
+function markRelayFallback(){
+  if(rtcRelayNoticeShown||!room.id)return;
+  rtcRelayNoticeShown=true;addSystem('Conexión P2P inestable: usando relay temporal del servidor.');
+}
+function relayGameTo(peerId,obj){
+  if(!room.id||!socket.connected||!peerId||!obj)return false;
+  try{socket.emit('game:relay',{target:peerId,payload:obj});markRelayFallback();return true;}catch{return false;}
+}
+function sendGame(link,obj){
+  if(!link||!obj)return false;
+  if(safeDcSend(link.dc,obj))return true;
+  return relayGameTo(link.peerId,obj);
+}
+async function loadRtcConfig(){
+  if(rtcConfigPromise)return rtcConfigPromise;
+  rtcConfigPromise=fetch('/rtc-config',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(cfg=>{
+    if(cfg&&Array.isArray(cfg.iceServers)&&cfg.iceServers.length){
+      RTC_CONFIG={iceServers:cfg.iceServers,iceCandidatePoolSize:Number(cfg.iceCandidatePoolSize)||2,iceTransportPolicy:cfg.iceTransportPolicy==='relay'?'relay':'all'};
+      const links=[...peerLinks.values(),hostLink].filter(Boolean);for(const l of links)try{if(l.pc?.signalingState!=='closed')l.pc.setConfiguration(RTC_CONFIG);}catch{}
+    }
+    return RTC_CONFIG;
+  }).catch(()=>RTC_CONFIG);
+  return rtcConfigPromise;
+}
+function requestHostRecovery(link,delay=2500){
   if(!room.id||isHost()||!link||link.peerId!==room.hostPeerId)return;
-  clearHostInterruptTimer();
-  hostInterruptTimer=setTimeout(()=>{
-    hostInterruptTimer=null;
-    if(room.id&&!isHost()&&room.hostPeerId===link.peerId&&!dcOpen(hostLink?.dc))interruptConnection();
+  if(dcOpen(link.dc)){clearHostInterruptTimer();return;}
+  if(!hostRecoveryDeadlineTimer)hostRecoveryDeadlineTimer=setTimeout(()=>{
+    hostRecoveryDeadlineTimer=null;
+    // WebRTC puede seguir bloqueado por NAT/CGNAT. Mientras Socket.IO siga vivo, NO expulsamos:
+    // el juego continúa por game:relay y seguimos intentando recuperar P2P.
+    if(room.id&&!isHost()&&socket.connected&&!dcOpen(hostLink?.dc))markRelayFallback();
+  },20000);
+  if(hostRecoveryTimer)return;
+  hostRecoveryTimer=setTimeout(()=>{
+    hostRecoveryTimer=null;
+    if(!room.id||isHost()||room.hostPeerId!==link.peerId||dcOpen(hostLink?.dc))return;
+    hostRecoveryAttempts++;
+    socket.emit('rtc:restart-request',{target:link.peerId,attempt:hostRecoveryAttempts});
+    if(hostRecoveryAttempts<4)requestHostRecovery(link,Math.min(7000,2500+hostRecoveryAttempts*1200));
   },delay);
 }
+function scheduleHostInterrupt(link,delay=2500){requestHostRecovery(link,delay);}
 function closeLink(link){if(!link)return;try{link.dc&&link.dc.close();}catch{}try{link.pc&&link.pc.close();}catch{}}
-function closeAllRtc(){clearHostInterruptTimer();for(const l of peerLinks.values())closeLink(l);peerLinks.clear();closeLink(hostLink);hostLink=null;peerInputs.clear();myPing=isHost()?0:999;}
+function closeAllRtc(){clearHostInterruptTimer();rtcRelayNoticeShown=false;for(const l of peerLinks.values())closeLink(l);peerLinks.clear();closeLink(hostLink);hostLink=null;peerInputs.clear();earlyIce.clear();myPing=isHost()?0:999;}
 function queueOrAddIce(link,candidate){if(!link||!candidate)return;if(link.pc.remoteDescription){link.pc.addIceCandidate(candidate).catch(()=>{});}else link.pendingIce.push(candidate);}
+function storeEarlyIce(peerId,candidate){if(!peerId||!candidate)return;const q=earlyIce.get(peerId)||[];if(q.length<64)q.push(candidate);earlyIce.set(peerId,q);}
+function adoptEarlyIce(link){if(!link)return;const q=earlyIce.get(link.peerId);if(q?.length){link.pendingIce.push(...q);earlyIce.delete(link.peerId);}}
 async function flushIce(link){if(!link?.pc?.remoteDescription)return;const q=link.pendingIce.splice(0);for(const c of q)try{await link.pc.addIceCandidate(c);}catch{}}
 function makePc(peerId){
-  const pc=new RTCPeerConnection(RTC_CONFIG),link={pc,dc:null,peerId,pendingIce:[],playerId:null,lastPingSent:0,pingSeq:0};
+  const pc=new RTCPeerConnection(RTC_CONFIG),link={pc,dc:null,peerId,pendingIce:[],playerId:null,lastPingSent:0,pingSeq:0,restarting:false,restartCount:0};
   pc.onicecandidate=e=>{if(e.candidate&&room.id)socket.emit('rtc:ice',{target:peerId,candidate:e.candidate});};
   return link;
 }
 function bindGameChannel(link,dc,asHost){
   link.dc=dc;dc.binaryType='arraybuffer';
-  dc.onopen=()=>{if(asHost){sendHostSnapshot(true,link);safeDcSend(dc,{t:'hello',host:true});}else{clearHostInterruptTimer();safeDcSend(dc,{t:'hello',host:false});startDirectPing();}};
+  dc.onopen=()=>{link.restartCount=0;link.restarting=false;if(asHost){sendHostSnapshot(true,link);safeDcSend(dc,{t:'hello',host:true});}else{clearHostInterruptTimer();rtcRelayNoticeShown=false;safeDcSend(dc,{t:'hello',host:false});startDirectPing();}};
   dc.onmessage=e=>{let m;try{m=JSON.parse(e.data);}catch{return;}if(asHost)handleGuestData(link,m);else handleHostData(link,m);};
-  dc.onclose=()=>{if(!room.id)return;if(asHost){peerInputs.delete(link.playerId);setTimeout(syncPeerTopology,700);}else{myPing=999;$('#pingHud').textContent='Ping: —';if(link.peerId===room.hostPeerId)scheduleHostInterrupt(link);setTimeout(syncPeerTopology,700);}};
-  dc.onerror=()=>{if(!asHost&&link.peerId===room.hostPeerId)scheduleHostInterrupt(link);};
+  dc.onclose=()=>{if(!room.id)return;if(asHost){peerInputs.delete(link.playerId);scheduleHostPeerRecovery(link,1200);}else{myPing=999;$('#pingHud').textContent='Ping: —';if(link.peerId===room.hostPeerId)requestHostRecovery(link,900);}};
+  dc.onerror=()=>{if(asHost)scheduleHostPeerRecovery(link,700);else if(link.peerId===room.hostPeerId)requestHostRecovery(link,700);};
+}
+async function offerHostLink(link,iceRestart=false){
+  if(!isHost()||!link||link.pc?.signalingState==='closed'||link.restarting)return false;
+  if(link.pc.signalingState!=='stable'){setTimeout(()=>offerHostLink(link,iceRestart),450);return false;}
+  link.restarting=true;
+  try{
+    try{link.pc.setConfiguration(RTC_CONFIG);}catch{}
+    if(iceRestart&&typeof link.pc.restartIce==='function')link.pc.restartIce();
+    const offer=await link.pc.createOffer(iceRestart?{iceRestart:true}:undefined);await link.pc.setLocalDescription(offer);socket.emit('rtc:offer',{target:link.peerId,sdp:link.pc.localDescription,restart:!!iceRestart});link.restartCount=(link.restartCount||0)+(iceRestart?1:0);return true;
+  }catch{return false;}finally{link.restarting=false;}
+}
+function scheduleHostPeerRecovery(link,delay=2200){
+  if(!isHost()||!link||link.peerId==null)return;
+  if(link.recoveryTimer)return;
+  link.recoveryTimer=setTimeout(async()=>{link.recoveryTimer=null;if(!isHost()||dcOpen(link.dc))return;const ok=await offerHostLink(link,true);if(!ok||link.restartCount>=3){
+      const p=players.find(x=>x.peerId===link.peerId&&!x.bot);if(!p)return;closeLink(link);peerLinks.delete(link.peerId);peerInputs.delete(p.id);setTimeout(()=>createHostPeer(p),450);
+    }else scheduleHostPeerRecovery(link,3500);
+  },delay);
 }
 async function createHostPeer(p){
   if(!isHost()||!p?.peerId||p.bot||p.id===myPlayerId||peerLinks.has(p.peerId))return;
+  await loadRtcConfig();
   const link=makePc(p.peerId);link.playerId=p.id;peerLinks.set(p.peerId,link);
   const dc=link.pc.createDataChannel('hb-game',{ordered:false,maxRetransmits:0});bindGameChannel(link,dc,true);
-  link.pc.onconnectionstatechange=()=>{if(['failed','closed'].includes(link.pc.connectionState)){closeLink(link);peerLinks.delete(p.peerId);peerInputs.delete(p.id);setTimeout(syncPeerTopology,900);}};
-  try{const offer=await link.pc.createOffer();await link.pc.setLocalDescription(offer);socket.emit('rtc:offer',{target:p.peerId,sdp:link.pc.localDescription});}catch{closeLink(link);peerLinks.delete(p.peerId);}
+  link.pc.onconnectionstatechange=()=>{const state=link.pc.connectionState;if(state==='connected'){link.restartCount=0;return;}if(state==='disconnected')scheduleHostPeerRecovery(link,3000);else if(state==='failed')scheduleHostPeerRecovery(link,250);};
+  const ok=await offerHostLink(link,false);if(!ok){closeLink(link);peerLinks.delete(p.peerId);setTimeout(()=>syncPeerTopology(),700);}
 }
 async function acceptHostOffer(from,sdp){
   if(!room.id||isHost()||from!==room.hostPeerId)return;
-  closeLink(hostLink);hostLink=makePc(from);
-  hostLink.pc.ondatachannel=e=>bindGameChannel(hostLink,e.channel,false);
-  hostLink.pc.onconnectionstatechange=()=>{
-    const link=hostLink,state=link?.pc?.connectionState;if(!link)return;
-    if(state==='connected'){clearHostInterruptTimer();return;}
-    if(state==='disconnected'){scheduleHostInterrupt(link,2600);return;}
-    if(['failed','closed'].includes(state)){if(link.peerId===room.hostPeerId)scheduleHostInterrupt(link,900);closeLink(link);if(hostLink===link)hostLink=null;myPing=999;setTimeout(syncPeerTopology,900);}
-  };
-  try{await hostLink.pc.setRemoteDescription(sdp);await flushIce(hostLink);const ans=await hostLink.pc.createAnswer();await hostLink.pc.setLocalDescription(ans);socket.emit('rtc:answer',{target:from,sdp:hostLink.pc.localDescription});}catch{closeLink(hostLink);hostLink=null;}
+  await loadRtcConfig();
+  let link=hostLink;
+  if(!link||link.peerId!==from||link.pc?.signalingState==='closed'){
+    closeLink(link);link=hostLink=makePc(from);adoptEarlyIce(link);
+    link.pc.ondatachannel=e=>bindGameChannel(link,e.channel,false);
+    link.pc.onconnectionstatechange=()=>{const current=hostLink,state=current?.pc?.connectionState;if(!current||current!==link)return;if(state==='connected'){clearHostInterruptTimer();rtcRelayNoticeShown=false;return;}if(state==='disconnected'){requestHostRecovery(link,3000);return;}if(state==='failed'){requestHostRecovery(link,250);myPing=999;$('#pingHud').textContent='Ping: —';}};
+  }
+  try{try{link.pc.setConfiguration(RTC_CONFIG);}catch{}await link.pc.setRemoteDescription(sdp);await flushIce(link);const ans=await link.pc.createAnswer();await link.pc.setLocalDescription(ans);socket.emit('rtc:answer',{target:from,sdp:link.pc.localDescription});}catch{requestHostRecovery(link,500);}
 }
-async function acceptGuestAnswer(from,sdp){const link=peerLinks.get(from);if(!link||!isHost())return;try{await link.pc.setRemoteDescription(sdp);await flushIce(link);}catch{}}
+async function acceptGuestAnswer(from,sdp){const link=peerLinks.get(from);if(!link||!isHost())return;try{await link.pc.setRemoteDescription(sdp);await flushIce(link);link.restartCount=0;}catch{scheduleHostPeerRecovery(link,500);}}
 function syncPeerTopology(){
   if(!room.id||typeof RTCPeerConnection==='undefined')return;
   if(isHost()){
@@ -202,16 +282,18 @@ function syncPeerTopology(){
 }
 socket.on('rtc:offer',m=>acceptHostOffer(m?.from,m?.sdp));
 socket.on('rtc:answer',m=>acceptGuestAnswer(m?.from,m?.sdp));
-socket.on('rtc:ice',m=>{const link=isHost()?peerLinks.get(m?.from):hostLink;if(link&&m?.from===link.peerId)queueOrAddIce(link,m.candidate);});
+socket.on('rtc:ice',m=>{const from=m?.from,link=isHost()?peerLinks.get(from):hostLink;if(link&&from===link.peerId)queueOrAddIce(link,m.candidate);else if(!isHost()&&from===room.hostPeerId)storeEarlyIce(from,m.candidate);});
+socket.on('rtc:restart-request',m=>{if(!isHost())return;const link=peerLinks.get(m?.from);if(link)scheduleHostPeerRecovery(link,0);});
+socket.on('game:relay',m=>{const from=m?.from,payload=m?.payload;if(!room.id||!from||!payload)return;if(isHost()){const link=peerLinks.get(from)||(()=>{const p=players.find(x=>x.peerId===from&&!x.bot);return p?{peerId:from,playerId:p.id,dc:null}:null;})();if(link)handleGuestData(link,payload);}else if(from===room.hostPeerId)handleHostData(hostLink||{peerId:from},payload);});
 function handleGuestData(link,m){
   if(!isHost()||!m)return;
   if(m.t==='i'){const p=players.find(x=>x.id===link.playerId);if(!p||p.bot)return;const prev=peerInputs.get(p.id);if(prev&&Number(m.seq)<prev.seq)return;peerInputs.set(p.id,{seq:Number(m.seq)||0,act:[clamp(Number(m.x)||0,-1,1),clamp(Number(m.y)||0,-1,1),m.k?1:0,m.c?1:0,m.p?1:0]});}
-  else if(m.t==='p'){safeDcSend(link.dc,{t:'q',n:m.n,ts:m.ts});}
+  else if(m.t==='p'){sendGame(link,{t:'q',n:m.n,ts:m.ts});}
 }
 function handleHostData(link,m){
   if(!m)return;if(m.t==='s')applyPacketToWorld(m,true);else if(m.t==='q'&&Number.isFinite(m.ts)){myPing=Math.max(0,Math.round(performance.now()-m.ts));socket.emit('player:ping',{ping:myPing});const me=human();if(me)me.ping=myPing;$('#pingHud').textContent=`Ping: ${myPing}`;}
 }
-function startDirectPing(){if(isHost()){myPing=0;return;}if(!dcOpen(hostLink?.dc))return;hostLink.pingSeq=(hostLink.pingSeq||0)+1;safeDcSend(hostLink.dc,{t:'p',n:hostLink.pingSeq,ts:performance.now()});}
+function startDirectPing(){if(isHost()){myPing=0;return;}if(dcOpen(hostLink?.dc)){hostLink.pingSeq=(hostLink.pingSeq||0)+1;safeDcSend(hostLink.dc,{t:'p',n:hostLink.pingSeq,ts:performance.now()});return;}if(socket.connected){const started=performance.now();socket.emit('net:ping',started,()=>{if(!room.id||isHost()||dcOpen(hostLink?.dc))return;myPing=Math.max(0,Math.round(performance.now()-started));socket.emit('player:ping',{ping:myPing});const me=human();if(me)me.ping=myPing;$('#pingHud').textContent=`Ping: ${myPing} (relay)`;});}}
 setInterval(()=>{if(!room.id)return;if(isHost()){myPing=0;$('#pingHud').textContent='Ping: 0';socket.emit('player:ping',{ping:0});}else startDirectPing();},900);
 function reportPageVisibility(){
   if(!room.id)return;
@@ -219,7 +301,7 @@ function reportPageVisibility(){
   if(!visible){
     keys.clear();
     if(isHost())sendHostSnapshot(true);
-    else if(dcOpen(hostLink?.dc)){inputSeq++;safeDcSend(hostLink.dc,{t:'i',x:0,y:0,k:false,c:!!specialModes.curve,p:!!specialModes.power,seq:inputSeq});lastSentInput=`0,0,0,${specialModes.curve?1:0},${specialModes.power?1:0}`;}
+    else if(hostLink||room.hostPeerId){inputSeq++;const link=hostLink||{peerId:room.hostPeerId,dc:null};sendGame(link,{t:'i',x:0,y:0,k:false,c:!!specialModes.curve,p:!!specialModes.power,seq:inputSeq});lastSentInput=`0,0,0,${specialModes.curve?1:0},${specialModes.power?1:0}`;}
   }
   socket.emit('player:visibility',{visible});
 }
@@ -229,7 +311,7 @@ function makeGamePacket(){
     ballCurveSpin:world.ballCurveSpin||0,ballCurveTicks:world.ballCurveTicks||0,ballCurveTotalTicks:world.ballCurveTotalTicks||0,ballCurveIntensity:world.ballCurveIntensity||0,ballCurveDir:Array.isArray(world.ballCurveDir)?world.ballCurveDir.slice(0,2):[0,0],ballColor:world.discs[0]?.color||world.ballBaseColor||'FFFFFF',
     discs:snap.map(d=>[d.x,d.y,d.vx,d.vy,d.r]),kickFlags:world.kickFlag.slice()};
 }
-function sendHostSnapshot(force=false,onlyLink=null){if(!isHost()||!world)return;const pkt=makeGamePacket();if(!pkt)return;lastNetPacket=pkt;prevPhysicsSnapshot=currPhysicsSnapshot||world.snapshot();currPhysicsSnapshot=world.snapshot();lastNetSnapshotAt=performance.now();const links=onlyLink?[onlyLink]:[...peerLinks.values()];for(const l of links)safeDcSend(l.dc,pkt);updateHud();}
+function sendHostSnapshot(force=false,onlyLink=null){if(!isHost()||!world)return;const pkt=makeGamePacket();if(!pkt)return;lastNetPacket=pkt;prevPhysicsSnapshot=currPhysicsSnapshot||world.snapshot();currPhysicsSnapshot=world.snapshot();lastNetSnapshotAt=performance.now();const links=onlyLink?[onlyLink]:[...peerLinks.values()];for(const l of links)sendGame(l,pkt);updateHud();}
 function botAction(p){
   if(!world)return [0,0,0];const i=world.playerIndexById.get(p.id);if(i==null)return [0,0,0];const d=world.discs[i],b=world.discs[0],attack=p.team===1?1:-1,dist=Math.sqrt((b.pos[0]-d.pos[0])**2+(b.pos[1]-d.pos[1])**2);let tx,ty;
   if(world.state===E.STATE_KICKOFF&&world.kickingTeam!==d.team){tx=p.team===1?-world.spawnDistance:world.spawnDistance;ty=0;}else{tx=b.pos[0]-attack*24;ty=b.pos[1];}
@@ -326,21 +408,21 @@ function renderRoomList(){
 $('#showEmptyRooms').onchange=renderRoomList;$('#showFullRooms').onchange=renderRoomList;$('#showLockedRooms').onchange=renderRoomList;
 $('#refreshRooms').onclick=()=>{socket.emit('rooms:get');flashButton($('#refreshRooms'),'Actualizando…');};
 $('#joinRoom').onclick=joinSelectedRoom;
-function joinSelectedRoom(){
+async function joinSelectedRoom(){
   const r=onlineRooms.find(x=>x.id===selectedRoomId);if(!r)return;
-  const password=r.password?(prompt('Contraseña de la sala:')??''):'';if(r.password&&password==='')return;lastJoinPassword=password;
-  socket.emit('room:join',Object.assign({roomId:r.id,password,nick:settings.nick},profilePayload()),res=>{if(!res?.ok){alert(res?.error||'No se pudo entrar.');return;}myPlayerId=res.myPlayerId;enterRoomState(res.state);});
+  const password=r.password?await haxPrompt('Esta sala requiere contraseña.',{title:'Contraseña de la sala',password:true}):'';if(r.password&&password===null)return;lastJoinPassword=password||'';
+  socket.emit('room:join',Object.assign({roomId:r.id,password:password||'',nick:settings.nick},profilePayload()),res=>{if(!res?.ok){haxNotice(res?.error||'No se pudo entrar.','No se pudo entrar','warning');return;}myPlayerId=res.myPlayerId;enterRoomState(res.state);});
 }
 $('#openCreate').onclick=()=>{$('#createName').value=`Sala de ${settings.nick}`;$('#createPass').value='';$('#unlistedBtn').dataset.unlisted='false';$('#unlistedBtn').textContent='Mostrar en la lista: Sí';show('createView');setTimeout(()=>$('#createName').focus(),0);};
 $('#cancelCreate').onclick=()=>show('roomsView');
 $('#unlistedBtn').onclick=()=>{const b=$('#unlistedBtn'),v=b.dataset.unlisted!=='true';b.dataset.unlisted=String(v);b.textContent=`Mostrar en la lista: ${v?'No':'Sí'}`;};
 $('#createConfirm').onclick=()=>{
   const name=$('#createName').value.trim();if(!name){$('#createName').focus();return;}
-  socket.emit('room:create',Object.assign({name,maxPlayers:+$('#createMax').value,password:$('#createPass').value,unlisted:$('#unlistedBtn').dataset.unlisted==='true',nick:settings.nick},profilePayload()),res=>{if(!res?.ok){alert(res?.error||'No se pudo crear la sala.');return;}myPlayerId=res.myPlayerId;lastJoinPassword=$('#createPass').value;enterRoomState(res.state);});
+  socket.emit('room:create',Object.assign({name,maxPlayers:+$('#createMax').value,password:$('#createPass').value,unlisted:$('#unlistedBtn').dataset.unlisted==='true',nick:settings.nick},profilePayload()),res=>{if(!res?.ok){haxNotice(res?.error||'No se pudo crear la sala.','No se pudo crear','warning');return;}myPlayerId=res.myPlayerId;lastJoinPassword=$('#createPass').value;enterRoomState(res.state);});
 };
 $('#optionsFromLobby').onclick=openSettings;
 $('#logoutBtn').onclick=()=>{show('nickView');setTimeout(()=>$('#nickInput').focus(),0);};
-$('#replaysBtn').onclick=()=>alert('Las repeticiones se graban desde una sala con el botón Grabar.');
+$('#replaysBtn').onclick=()=>haxNotice('Las repeticiones se graban desde una sala con el botón Grabar.','Repeticiones');
 
 function populateCountrySelect(){
   const sel=$('#miscCountry');if(sel.options.length)return;
@@ -370,17 +452,17 @@ async function compressAvatarFile(file){
     if(data.length>24000)data=c.toDataURL('image/jpeg',.62);if(data.length>24000)throw new Error('La imagen sigue siendo demasiado pesada. Probá con otra.');return data;
   }finally{URL.revokeObjectURL(url);}
 }
-$('#avatarImageFile').onchange=async e=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;try{settings.avatarImage=await compressAvatarFile(file);saveSettings();refreshAvatarPreview();if(room.id)socket.emit('profile:update',profilePayload());}catch(err){alert(err.message||'No se pudo cargar la imagen.');}};
+$('#avatarImageFile').onchange=async e=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;try{settings.avatarImage=await compressAvatarFile(file);saveSettings();refreshAvatarPreview();if(room.id)socket.emit('profile:update',profilePayload());}catch(err){haxNotice(err.message||'No se pudo cargar la imagen.','Icono personalizado','warning');}};
 refreshMiscUI();
 
 
-socket.on('connect',()=>{if(!room.id)connectionInterruptedHandled=false;socket.emit('rooms:get');});
+socket.on('connect',()=>{if(!room.id)connectionInterruptedHandled=false;clearTimeout(hostInterruptTimer);hostInterruptTimer=null;socket.emit('rooms:get');loadRtcConfig();});
 socket.on('rooms:list',list=>{onlineRooms=Array.isArray(list)?list:[];if(!selectedRoomId)selectedRoomId=onlineRooms[0]?.id||null;renderRoomList();
   if(pendingRoomFromUrl&&$('#roomsView')&&!$('#roomsView').classList.contains('hidden')){const r=onlineRooms.find(x=>x.id===pendingRoomFromUrl);if(r){selectedRoomId=r.id;pendingRoomFromUrl=null;setTimeout(joinSelectedRoom,30);}}
 });
 socket.on('disconnect',()=>{if(room.id)interruptConnection();});
-socket.on('room:closed',data=>{alert(data?.message||'La sala se cerró.');resetToLobby();});
-socket.on('room:kicked',data=>{alert(data?.ban?'Fuiste baneado de la sala.':'Fuiste expulsado de la sala.');resetToLobby();});
+socket.on('room:closed',data=>{const msg=data?.message||'La sala se cerró.';resetToLobby();haxNotice(msg,'Sala cerrada','warning');});
+socket.on('room:kicked',data=>{const banned=!!data?.ban;resetToLobby();haxNotice(banned?'Fuiste baneado de la sala.':'Fuiste expulsado de la sala.',banned?'Baneado':'Expulsado','danger');});
 socket.on('chat:message',m=>{if(!m)return;addChat(m.text||'',m.type||'system',m.name||'');});
 // El ping mostrado durante una sala se mide directo contra el host por WebRTC.
 /* ---------- room ---------- */
@@ -405,12 +487,13 @@ function syncRoomUI(){
 }
 function applyRoomState(st){
   if(!st||st.id!==room.id)return;
-  const oldSig=currentActiveSignature(),oldStadium=selectedStadiumKey,oldWorld=world,wasRunning=gameRunning,wasPaused=paused,wasEnding=endingGame;
+  const oldSig=currentActiveSignature(),oldStadium=selectedStadiumKey,oldWorld=world,oldHostPeerId=room.hostPeerId,wasRunning=gameRunning,wasPaused=paused,wasEnding=endingGame;
   players=(st.players||[]).map(p=>Object.assign({},p));teamsLocked=!!st.teamsLocked;
   room=Object.assign(room,{id:st.id,name:st.name,maxPlayers:st.maxPlayers,unlisted:st.unlisted,owned:myPlayerId===st.ownerPlayerId,hostPeerId:st.hostPeerId||null,timeLimit:st.timeLimit,scoreLimit:st.scoreLimit});
   selectedStadiumKey=st.stadiumKey||'classic';selectedStadium=st.stadium||E.CLASSIC;customStadium=selectedStadiumKey==='custom'?selectedStadium:null;teamKits=st.teamKits||teamKits;
   gameRunning=!!st.game?.running;paused=!!st.game?.paused;overtime=!!st.game?.overtime;if(!isHost()||!wasRunning)elapsedTicks=st.game?.elapsedTicks||elapsedTicks;endingGame=!!st.game?.ending;finalWinner=st.game?.finalWinner||0;
-  const started=!wasRunning&&gameRunning,stopped=(wasRunning||wasEnding)&&!(gameRunning||endingGame),mustRebuild=started||(oldSig!==currentActiveSignature())||(oldStadium!==selectedStadiumKey);
+  const started=!wasRunning&&gameRunning,stopped=(wasRunning||wasEnding)&&!(gameRunning||endingGame),hostChanged=!!oldHostPeerId&&oldHostPeerId!==room.hostPeerId,mustRebuild=started||(oldSig!==currentActiveSignature())||(oldStadium!==selectedStadiumKey);
+  if(started||hostChanged)lastAppliedNetTick=-1;
   if(started&&isHost()){hostPendingWinner=0;hostFinishing=false;goalScoringTeam=0;elapsedTicks=0;overtime=false;lastNetPacket=null;world=null;resetSpecialCharge();}
   ensureGameWorld(mustRebuild,mustRebuild&&oldWorld&&!started?oldWorld:null);
   // Al entrar a una partida ya iniciada todavía no existe un snapshot WebRTC.
@@ -420,17 +503,17 @@ function applyRoomState(st){
   if(stopped){hostPendingWinner=0;hostFinishing=false;goalScoringTeam=0;resetSpecialCharge();}
   syncPeerTopology();syncRoomUI();syncGameViewState();
   if(started){menuOpen=false;$('#roomMenu').classList.add('closed');syncGameViewState();}
-  if(isHost()&&world&&(started||mustRebuild||wasPaused!==paused))setTimeout(()=>sendHostSnapshot(true),0);
+  if(isHost()&&world&&(started||mustRebuild||hostChanged||wasPaused!==paused))setTimeout(()=>sendHostSnapshot(true),0);
 }
 function enterRoomState(st){
-  connectionInterruptedHandled=false;clearHostInterruptTimer();resetSpecialModes();
+  connectionInterruptedHandled=false;clearHostInterruptTimer();rtcRelayNoticeShown=false;resetSpecialModes();
   room={id:st.id,name:st.name,maxPlayers:st.maxPlayers,password:'',unlisted:st.unlisted,owned:myPlayerId===st.ownerPlayerId,hostPeerId:st.hostPeerId||null,timeLimit:st.timeLimit,scoreLimit:st.scoreLimit};
-  closeAllRtc();players=[];world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;overtime=false;elapsedTicks=0;endingGame=false;finalWinner=0;goalScoringTeam=0;menuOpen=true;keys.clear();resetVisualCamera();
+  closeAllRtc();players=[];world=null;lastNetPacket=null;lastAppliedNetTick=-1;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;overtime=false;elapsedTicks=0;endingGame=false;finalWinner=0;goalScoringTeam=0;menuOpen=true;keys.clear();resetVisualCamera();
   clearChat();applyRoomState(st);if(settings.extrapolationTouched)addSystem(`Extrapolation: ${settings.extrapolation} ms.`);applySettingsToUI();resizeCanvas();show('gameView');setRoomMenu(!(gameRunning||endingGame));render();
   setTimeout(reportPageVisibility,0);
 }
 function resetToLobby(){
-  connectionInterruptedHandled=false;clearHostInterruptTimer();resetSpecialModes();closeAllRtc();room={id:null,name:'',maxPlayers:8,password:'',unlisted:false,owned:false,hostPeerId:null};players=[];myPlayerId=null;world=null;lastNetPacket=null;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;endingGame=false;keys.clear();hidePlayerContext();show('roomsView');socket.emit('rooms:get');
+  connectionInterruptedHandled=false;clearHostInterruptTimer();rtcRelayNoticeShown=false;resetSpecialModes();closeAllRtc();room={id:null,name:'',maxPlayers:8,password:'',unlisted:false,owned:false,hostPeerId:null};players=[];myPlayerId=null;world=null;lastNetPacket=null;lastAppliedNetTick=-1;prevPhysicsSnapshot=null;currPhysicsSnapshot=null;gameRunning=false;paused=false;endingGame=false;keys.clear();hidePlayerContext();show('roomsView');socket.emit('rooms:get');
 }
 function leaveRoom(){socket.emit('room:leave',{},()=>resetToLobby());}
 $('#leaveRoomBtn').onclick=leaveRoom;
@@ -466,7 +549,7 @@ function selectStadiumKey(v){
 }
 $('#stadiumSelect').onchange=()=>selectStadiumKey($('#stadiumSelect').value);$('#stadiumPickBtn').onclick=()=>{$('#stadiumModal').classList.remove('hidden');};$('#closeStadium').onclick=()=>$('#stadiumModal').classList.add('hidden');
 $$('.stadium-choice').forEach(b=>b.onclick=()=>{const v=b.dataset.stadium;if(v==='custom'){$('#stadiumModal').classList.add('hidden');$('#stadiumFile').click();return;}if(selectStadiumKey(v))$('#stadiumModal').classList.add('hidden');});
-$('#stadiumFile').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{const obj=E.validateStadium(JSON.parse(await file.text()));socket.emit('room:setStadium',{key:'custom',stadium:obj},res=>{if(!res?.ok)addSystem(res?.error||'Mapa inválido.');});}catch(err){alert(err.message);}e.target.value='';};
+$('#stadiumFile').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{const obj=E.validateStadium(JSON.parse(await file.text()));socket.emit('room:setStadium',{key:'custom',stadium:obj},res=>{if(!res?.ok)addSystem(res?.error||'Mapa inválido.');});}catch(err){haxNotice(err.message||'No se pudo cargar el estadio.','Estadio inválido','warning');}e.target.value='';};
 /* ---------- game rules ---------- */
 function startGame(){if(!human()?.admin)return;socket.emit('room:gameAction',{action:gameRunning?'stop':'start'},res=>{if(res&&!res.ok&&res.error)addSystem(res.error);});}
 $('#startStop').onclick=startGame;
@@ -476,10 +559,10 @@ function tick(){
   if(!room.id||!socket.connected)return;const me=human(),act=me&&(me.team===1||me.team===2)&&gameRunning&&!paused?humanAction():[0,0,0,specialModes.curve?1:0,specialModes.power?1:0];
   if(isHost()){hostStep(act);return;}
   lastActions=new Map();if(me)lastActions.set(me.id,act);
-  const key=act.join(',');inputSeq++;if(key!==lastSentInput||inputSeq%2===0){safeDcSend(hostLink?.dc,{t:'i',x:act[0],y:act[1],k:!!act[2],c:!!act[3],p:!!act[4],seq:inputSeq});lastSentInput=key;}
+  const key=act.join(',');inputSeq++;if(key!==lastSentInput||inputSeq%2===0){sendGame(hostLink||{peerId:room.hostPeerId,dc:null},{t:'i',x:act[0],y:act[1],k:!!act[2],c:!!act[3],p:!!act[4],seq:inputSeq});lastSentInput=key;}
 }
 function applyPacketToWorld(pkt,refresh=true){
-  if(!pkt)return;lastNetPacket=pkt;gameRunning=!!pkt.running;paused=!!pkt.paused;overtime=!!pkt.overtime;elapsedTicks=pkt.elapsedTicks||0;endingGame=!!pkt.ending;finalWinner=pkt.finalWinner||0;goalScoringTeam=pkt.goalScoringTeam||0;
+  if(!pkt)return;const netTick=Math.max(0,Number(pkt.tick)||0)|0;if(lastAppliedNetTick>=0&&netTick<lastAppliedNetTick)return;lastAppliedNetTick=netTick;lastNetPacket=pkt;gameRunning=!!pkt.running;paused=!!pkt.paused;overtime=!!pkt.overtime;elapsedTicks=pkt.elapsedTicks||0;endingGame=!!pkt.ending;finalWinner=pkt.finalWinner||0;goalScoringTeam=pkt.goalScoringTeam||0;
   if(!world)world=new E.World(selectedStadium,players);if(!Array.isArray(pkt.discs)||pkt.discs.length!==world.discs.length){world=new E.World(selectedStadium,players);if(pkt.discs?.length!==world.discs.length){prevPhysicsSnapshot=world.snapshot();currPhysicsSnapshot=world.snapshot();lastNetSnapshotAt=performance.now();return;}}
   prevPhysicsSnapshot=currPhysicsSnapshot||world.snapshot();
   for(let i=0;i<pkt.discs.length;i++){const a=pkt.discs[i],d=world.discs[i];d.pos[0]=+a[0];d.pos[1]=+a[1];d.vel[0]=+a[2];d.vel[1]=+a[3];if(a[4]!=null)d.radius=+a[4];}
@@ -488,7 +571,7 @@ function applyPacketToWorld(pkt,refresh=true){
   if(replayRecording&&pkt.tick%2===0)replayFrames.push({t:pkt.tick,score:[world.redScore,world.blueScore],state:world.state,discs:currPhysicsSnapshot.map(d=>[d.x,d.y,d.vx,d.vy])});
   if(refresh){syncGameViewState();updateHud();}
 }
-// Los snapshots de partida llegan por el DataChannel WebRTC del host, no por Socket.IO.
+// Los snapshots prefieren DataChannel WebRTC; Socket.IO queda como relay de respaldo si P2P/ICE falla.
 /* ---------- chat ---------- */
 function clearChat(){$('#chatLog').innerHTML='';}
 function addChat(text,type='system',name=''){const d=document.createElement('div');d.className='chat-msg '+type;if(name){const n=document.createElement('span');n.className='chat-name';n.textContent=name+': ';d.appendChild(n);}d.appendChild(document.createTextNode(text));$('#chatLog').appendChild(d);$('#chatLog').scrollTop=$('#chatLog').scrollHeight;}
@@ -524,6 +607,7 @@ $('#chatResize').addEventListener('pointerup',e=>{chatDrag=null;try{$('#chatResi
 
 /* ---------- keyboard ---------- */
 window.addEventListener('keydown',e=>{
+  if($('#interactionModal').classList.contains('hidden')===false)return;
   if($('#avatarModal').classList.contains('hidden')===false){if(e.key==='Escape'){e.preventDefault();closeAvatarModal();}return;}
   if($('#miscModal').classList.contains('hidden')===false){if(e.key==='Escape'){e.preventDefault();closeMisc();}return;}
   if($('#stadiumModal').classList.contains('hidden')===false){if(e.key==='Escape'){e.preventDefault();$('#stadiumModal').classList.add('hidden');}return;}
@@ -585,7 +669,7 @@ $('#recBtn').onclick=()=>{
   else{addSystem('Grabación detenida.');downloadReplay();}
 };
 function downloadReplay(){if(!replayFrames.length)return;const data={format:'HB-LOCAL-REPLAY-1',room:room.name,stadium:selectedStadium.name||'Custom',players:players.map(p=>({id:p.id,name:p.name,team:p.team,bot:p.bot})),frames:replayFrames};const blob=new Blob([JSON.stringify(data)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='hb-local-replay.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500);}
-$('#linkBtn').onclick=async()=>{if(!room.id)return;const u=new URL(location.href);u.searchParams.set('room',room.id);try{await navigator.clipboard.writeText(u.toString());addSystem('Enlace de la sala copiado.');}catch{prompt('Copiá el enlace de la sala:',u.toString());}};
+$('#linkBtn').onclick=async()=>{if(!room.id)return;const u=new URL(location.href);u.searchParams.set('room',room.id);try{await navigator.clipboard.writeText(u.toString());addSystem('Enlace de la sala copiado.');}catch{await haxPrompt('Copiá el enlace de la sala:',{title:'Enlace de la sala',value:u.toString()});}};
 function flashButton(btn,text){const old=btn.textContent;btn.textContent=text;setTimeout(()=>btn.textContent=old,600);}
 
 /* ---------- render ---------- */
@@ -832,6 +916,7 @@ function updateGameAnnouncement(){
 }
 function updateHud(){
   $('#redScore').textContent=world?world.redScore:0;$('#blueScore').textContent=world?world.blueScore:0;$('#clockText').textContent=formatTime(elapsedTicks);$('#overtimeText').classList.toggle('hidden',!overtime||menuOpen);
+  const limitTicks=Math.max(0,Number(room.timeLimit)||0)*3600,remainingTicks=limitTicks>0?Math.max(0,limitTicks-elapsedTicks):Infinity;$('#scoreHud .clock').classList.toggle('clock-warning',gameRunning&&!overtime&&limitTicks>0&&remainingTicks<=1800&&remainingTicks>0);
   let hint='';if(gameRunning&&world){if(paused)hint='Partida pausada';else if(world.state===E.STATE_KICKOFF)hint=`Saca ${world.kickingTeam===F.RED?'Rojo':'Azul'}`;else if(world.state===E.STATE_GOAL)hint='¡Gol!';}
   $('#kickHint').textContent=hint||'¡Presioná X para patear!';$('#pingHud').textContent=`Ping: ${myPing}`;updateGameAnnouncement();
 }
@@ -840,5 +925,5 @@ function loop(now){
   const target=+settings.fps;if(target===0||now-lastRender>=1000/target-1){render();lastRender=now;}requestAnimationFrame(loop);
 }
 
-applySettingsToUI();syncSettingsFields();renderRoomList();syncGameViewState();updateHud();requestAnimationFrame(loop);
+loadRtcConfig();applySettingsToUI();syncSettingsFields();renderRoomList();syncGameViewState();updateHud();requestAnimationFrame(loop);
 })();
