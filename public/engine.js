@@ -38,10 +38,10 @@ function collides(a,b){return (a.cgroup&b.cmask)!==0 && (a.cmask&b.cgroup)!==0;}
 function discDisc(a,b){
   const dx=a.pos[0]-b.pos[0],dy=a.pos[1]-b.pos[1];
   const d2=dx*dx+dy*dy,rs=a.radius+b.radius;
-  if(!(d2>0 && d2<=rs*rs))return;
+  if(!(d2>0 && d2<=rs*rs))return false;
   const dist=Math.sqrt(d2),nx=dx/dist,ny=dy/dist;
   const denom=a.invMass+b.invMass;
-  if(denom===0)return;
+  if(denom===0)return false;
   const mf=a.invMass/denom,overlap=rs-dist,pf=overlap*mf;
   a.pos[0]+=nx*pf;a.pos[1]+=ny*pf;
   const ob=overlap-pf;b.pos[0]-=nx*ob;b.pos[1]-=ny*ob;
@@ -51,6 +51,7 @@ function discDisc(a,b){
     const ca=mf*nv;a.vel[0]-=nx*ca;a.vel[1]-=ny*ca;
     const cb=nv-ca;b.vel[0]+=nx*cb;b.vel[1]+=ny*cb;
   }
+  return true;
 }
 function discVertex(d,v){
   const dx=d.pos[0]-v.pos[0],dy=d.pos[1]-v.pos[1],dist=Math.sqrt(dx*dx+dy*dy);
@@ -59,7 +60,9 @@ function discVertex(d,v){
     d.pos[0]+=nx*(d.radius-dist);d.pos[1]+=ny*(d.radius-dist);
     const nv=d.vel[0]*nx+d.vel[1]*ny;
     if(nv<0){const bounce=-(1+d.bcoef*v.bcoef);d.vel[0]+=nx*nv*bounce;d.vel[1]+=ny*nv*bounce;}
+    return true;
   }
+  return false;
 }
 function discPlane(d,p){
   const len=Math.sqrt(p.normal[0]*p.normal[0]+p.normal[1]*p.normal[1]);
@@ -69,7 +72,9 @@ function discPlane(d,p){
     d.pos[0]+=nx*dist;d.pos[1]+=ny*dist;
     const nv=d.vel[0]*nx+d.vel[1]*ny;
     if(nv<0){const bounce=-(1+d.bcoef*p.bcoef);d.vel[0]+=p.normal[0]*nv*bounce;d.vel[1]+=p.normal[1]*nv*bounce;}
+    return true;
   }
+  return false;
 }
 function segmentNoCurve(pd,v0,v1){
   const sx=v1[0]-v0[0],sy=v1[1]-v0[1];
@@ -101,7 +106,9 @@ function segmentFinal(d,s,dist,normal){
     d.pos[0]+=normal[0]*(d.radius-dist);d.pos[1]+=normal[1]*(d.radius-dist);
     const nv=d.vel[0]*normal[0]+d.vel[1]*normal[1];
     if(nv<0){const bounce=-(1+d.bcoef*s.bcoef);d.vel[0]+=normal[0]*nv*bounce;d.vel[1]+=normal[1]*nv*bounce;}
+    return true;
   }
+  return false;
 }
 function buildSegment(v0raw,v1raw,curveDeg,biasRaw,bcoef,cgroup,cmask,vis,color,curveFRaw){
   // Official .hbs rule: when curveF exists, curve is ignored. curveF is the
@@ -308,14 +315,18 @@ class World{
   resolveCollisions(){
     const n=this.discs.length;let ballHitWall=false;
     for(let i=0;i<n;i++){
-      for(let j=i+1;j<n;j++){const a=this.discs[i],b=this.discs[j];if(!collides(a,b))continue;if((i===0&&b.invMass===0)||(j===0&&a.invMass===0))ballHitWall=true;discDisc(a,b);}
+      for(let j=i+1;j<n;j++){
+        const a=this.discs[i],b=this.discs[j];if(!collides(a,b))continue;
+        const actuallyHit=discDisc(a,b);
+        if(actuallyHit&&((i===0&&b.invMass===0)||(j===0&&a.invMass===0)))ballHitWall=true;
+      }
       const d=this.discs[i];if(d.invMass===0)continue;
-      for(const v of this.vertices)if(collides(d,v)){if(i===0)ballHitWall=true;discVertex(d,v);}
-      for(const p of this.planes)if(collides(d,p)){if(i===0)ballHitWall=true;discPlane(d,p);}
+      for(const v of this.vertices)if(collides(d,v)){const actuallyHit=discVertex(d,v);if(i===0&&actuallyHit)ballHitWall=true;}
+      for(const p of this.planes)if(collides(d,p)){const actuallyHit=discPlane(d,p);if(i===0&&actuallyHit)ballHitWall=true;}
       for(const s of this.segments){
         if(!collides(d,s))continue;
         let hit=s.curve!==0?segmentCurve(d.pos,s):segmentNoCurve(d.pos,s.v0,s.v1);
-        if(!hit)continue;hit=segmentBias(s.bias,hit[0],hit[1]);if(hit){if(i===0)ballHitWall=true;segmentFinal(d,s,hit[0],hit[1]);}
+        if(!hit)continue;hit=segmentBias(s.bias,hit[0],hit[1]);if(hit){const actuallyHit=segmentFinal(d,s,hit[0],hit[1]);if(i===0&&actuallyHit)ballHitWall=true;}
       }
     }
     return ballHitWall;
@@ -376,11 +387,10 @@ class World{
       const accel=this.kickFlag[k]?d.kickAccel:d.accel;
       d.vel[0]+=nx*accel;d.vel[1]+=ny*accel;
     }
-    // Comba autoritativa. Conservamos el SENTIDO de giro, pero la aceleración lateral
-    // se recalcula perpendicular a la velocidad ACTUAL de la pelota. Esto es clave tras
-    // un rebote en pared/poste: la colisión decide la nueva trayectoria y, desde el tick
-    // siguiente, la comba continúa sobre esa trayectoria nueva en vez de empujar hacia
-    // una dirección absoluta vieja (que podía pegar/frenar/acelerar raro contra paredes).
+    // Comba autoritativa mientras la pelota está en vuelo libre. La fuerza se mantiene
+    // perpendicular a la velocidad para doblar la trayectoria sin convertirla en otro
+    // powershot. Si después hay un choque REAL con pared/poste, resolveCollisions lo
+    // informa y el efecto se cancela inmediatamente más abajo.
     if(this.ballCurveTicks>0&&this.ballCurveIntensity>0){
       const cb=this.discs[0],elapsed=(Math.max(0,(this.ballCurveTotalTicks||96)-this.ballCurveTicks))/60;
       const increasing=(Math.min(elapsed*3,.7)*(1+this.ballCurveIntensity*4))/1.6;
