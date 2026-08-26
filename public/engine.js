@@ -306,18 +306,19 @@ class World{
     return null;
   }
   resolveCollisions(){
-    const n=this.discs.length;
+    const n=this.discs.length;let ballHitWall=false;
     for(let i=0;i<n;i++){
-      for(let j=i+1;j<n;j++){const a=this.discs[i],b=this.discs[j];if(collides(a,b))discDisc(a,b);}
+      for(let j=i+1;j<n;j++){const a=this.discs[i],b=this.discs[j];if(!collides(a,b))continue;if((i===0&&b.invMass===0)||(j===0&&a.invMass===0))ballHitWall=true;discDisc(a,b);}
       const d=this.discs[i];if(d.invMass===0)continue;
-      for(const v of this.vertices)if(collides(d,v))discVertex(d,v);
-      for(const p of this.planes)if(collides(d,p))discPlane(d,p);
+      for(const v of this.vertices)if(collides(d,v)){if(i===0)ballHitWall=true;discVertex(d,v);}
+      for(const p of this.planes)if(collides(d,p)){if(i===0)ballHitWall=true;discPlane(d,p);}
       for(const s of this.segments){
         if(!collides(d,s))continue;
         let hit=s.curve!==0?segmentCurve(d.pos,s):segmentNoCurve(d.pos,s.v0,s.v1);
-        if(!hit)continue;hit=segmentBias(s.bias,hit[0],hit[1]);if(hit)segmentFinal(d,s,hit[0],hit[1]);
+        if(!hit)continue;hit=segmentBias(s.bias,hit[0],hit[1]);if(hit){if(i===0)ballHitWall=true;segmentFinal(d,s,hit[0],hit[1]);}
       }
     }
+    return ballHitWall;
   }
   step(actionsById,predictionOnly=false){
     this.lastGoalConceding=null;this.lastKickBy=null;this.lastBallKickBy=null;
@@ -337,10 +338,14 @@ class World{
         const dx=target.pos[0]-px,dy=target.pos[1]-py,dist=SQRT(dx,dy);
         if(dist-target.radius-pr<4 && kickAllowed && dist>0){
           const nx=dx/dist,ny=dy/dist,curveCharge=clamp(Number(act[3])||0,0,1),powerCharge=clamp(Number(act[4])||0,0,1),specialCharge=Math.max(curveCharge,powerCharge);
-          // Basado en implementaciones de Curve/Power de la comunidad: el golpe fuerte
-          // ronda 1.4x y la curva cargada llega aproximadamente a 1.5-1.6x. Usamos 1.50x
-          // como máximo estable y lo aplicamos RELATIVO al kickStrength de cada estadio.
-          const powerMul=target.kind==='ball'?(1+.50*specialCharge):1;
+          // Powershot conserva una escala fija (hasta 1.50x). La comba usa la misma
+          // base en x1/x2, pero aumenta gradualmente en los Futsal grandes usando el ancho
+          // REAL del .hbs. La raiz cuadrada evita hacer x7 absurdamente 3.57 veces mas fuerte:
+          // x1/2 1.50x, x3 ~1.61x, x4 ~1.69x, x5 ~1.80x, x7 ~1.93x a carga maxima.
+          const stadiumName=String(this.stadium?.name||'').toLowerCase(),stadiumWidth=Math.max(420,Number(this.stadium?.width)||420);
+          const curveMapScale=stadiumName.includes('futsal')?clamp(Math.sqrt(stadiumWidth/420),1,1.85):1;
+          const specialPowerExtra=curveCharge>0?.50*curveCharge*curveMapScale:.50*powerCharge;
+          const powerMul=target.kind==='ball'?(1+specialPowerExtra):1;
           target.vel[0]+=nx*ks*powerMul*target.invMass;target.vel[1]+=ny*ks*powerMul*target.invMass;
           d.vel[0]+=nx*-kb*pim;d.vel[1]+=ny*-kb*pim;
           if(target.kind==='ball'){
@@ -405,7 +410,13 @@ class World{
       const d=this.discs[di];d.pos[0]+=d.vel[0];d.pos[1]+=d.vel[1];
       d.vel[0]=(d.vel[0]+d.gravity[0])*d.damping;d.vel[1]=(d.vel[1]+d.gravity[1])*d.damping;
     }
-    this.resolveCollisions();this.steps++;
+    const ballHitWall=this.resolveCollisions();
+    // En el modo COMBA, el primer rebote contra pared/segmento/plano/poste cancela
+    // inmediatamente el efecto lateral. El rebote conserva toda la velocidad que ya
+    // tenia (incluida la potencia del disparo), pero desde el siguiente tick vuela como
+    // una pelota normal. Powershot no tiene fuerza persistente, asi que su potencia sigue.
+    if(ballHitWall&&this.ballCurveTicks>0){this.ballCurveSpin=0;this.ballCurveTicks=0;this.ballCurveTotalTicks=0;this.ballCurveIntensity=0;this.ballCurveDir=[0,0];}
+    this.steps++;
     if(this.state===STATE_KICKOFF){
       const ko=this.kickingTeam===F.RED?F.REDKO:F.BLUEKO;
       for(let k=0;k<this.nPlayers;k++)this.discs[this.firstPlayer+k].cmask=F.PLAYER_COLLISION|ko;
